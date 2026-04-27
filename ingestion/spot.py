@@ -106,9 +106,7 @@ def normalize_storage_symbol(exchange: Exchange, symbol: str, market: Market) ->
     """Normalize symbol to storage form for selected exchange/market."""
 
     if exchange == "binance":
-        if market != "spot":
-            raise ValueError("Binance adapter currently supports spot candles only")
-        return symbol.upper()
+        return binance.normalize_symbol(symbol=symbol, market=market)
     if exchange == "deribit":
         return deribit.normalize_symbol(symbol=symbol, market=market)
     raise ValueError(f"Unsupported exchange '{exchange}'")
@@ -128,7 +126,12 @@ def fetch_candles(
     normalized_symbol = normalize_storage_symbol(exchange=exchange, symbol=symbol, market=market)
 
     if exchange == "binance":
-        rows = binance.fetch_klines(symbol=symbol, interval=normalized_interval, limit=limit)
+        rows = binance.fetch_klines(
+            symbol=normalized_symbol,
+            interval=normalized_interval,
+            limit=limit,
+            market=market,
+        )
     elif exchange == "deribit":
         rows = deribit.fetch_klines(
             symbol=symbol,
@@ -158,7 +161,11 @@ def fetch_candles_all_history(
     normalized_symbol = normalize_storage_symbol(exchange=exchange, symbol=symbol, market=market)
 
     if exchange == "binance":
-        rows = binance.fetch_klines_all(symbol=symbol, interval=normalized_interval)
+        rows = binance.fetch_klines_all(
+            symbol=normalized_symbol,
+            interval=normalized_interval,
+            market=market,
+        )
     elif exchange == "deribit":
         rows = deribit.fetch_klines_all(
             symbol=symbol,
@@ -189,10 +196,11 @@ def fetch_candles_range(
 
     if exchange == "binance":
         rows = binance.fetch_klines_range(
-            symbol=symbol,
+            symbol=normalized_symbol,
             interval=normalized_interval,
             start_open_ms=start_open_ms,
             end_open_ms=end_open_ms,
+            market=market,
         )
     elif exchange == "deribit":
         rows = deribit.fetch_klines_range(

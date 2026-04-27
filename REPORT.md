@@ -1,7 +1,7 @@
 # Multi-Exchange Candle Ingestion Baseline for BTC/ETH (Binance + Deribit)
 
 ## Abstract
-This report documents the first implementation stage of a modular crypto data ingestion framework designed for research and production workflows. The immediate objective is to establish a reproducible baseline pipeline to fetch BTC/ETH market candles, including prices and traded volume, through public REST endpoints across multiple exchanges. We implement typed exchange adapters for Binance and Deribit and expose the workflow through a CLI command that supports configurable exchange, market type, symbols, interval, and request depth. The current dataset sources are Binance kline data and Deribit tradingview chart data queried on demand; each run returns recent OHLCV observations for specified instruments. Findings at this stage are engineering-focused: the pipeline successfully normalizes heterogeneous exchange payloads into deterministic records, validates timeframe constraints per exchange, supports paginated downloads for long lookbacks, provides full gap-fill synchronization (internal missing intervals and latest-tail backfill) from parquet state when explicit limits are omitted, can generate local price/volume plots for quick run-level verification, can persist downloaded candles to partitioned parquet lake storage for downstream ingestion, and includes a reproducible Docker Compose scaffold for TimescaleDB bootstrapping. The contribution of this stage is a maintainable ingestion foundation that can be extended to L2 order books, funding rates, and database-backed full/backfill synchronization modes in later iterations.
+This report documents the first implementation stage of a modular crypto data ingestion framework designed for research and production workflows. The immediate objective is to establish a reproducible baseline pipeline to fetch BTC/ETH market candles, including prices and traded volume, through public REST endpoints across multiple exchanges. We implement typed exchange adapters for Binance and Deribit and expose the workflow through a CLI command that supports configurable exchange, market type, symbols, interval, and request depth. The current dataset sources are Binance kline data and Deribit tradingview chart data queried on demand; each run returns recent OHLCV observations for specified instruments. Findings at this stage are engineering-focused: the pipeline successfully normalizes heterogeneous exchange payloads into deterministic records, validates timeframe constraints per exchange, supports paginated downloads for long lookbacks, provides full gap-fill synchronization (internal missing intervals and latest-tail backfill) from parquet state when explicit limits are omitted, can generate local price/volume plots for quick run-level verification, can persist downloaded candles to partitioned parquet lake storage for downstream ingestion, includes a reproducible Docker Compose scaffold for TimescaleDB bootstrapping, and now includes a dedicated parquet-to-TimescaleDB loader with incremental file-state tracking for idempotent upserts. The contribution of this stage is a maintainable ingestion foundation that can be extended to L2 order books, funding rates, and database-backed full/backfill synchronization modes in later iterations.
 
 ## Introduction
 Crypto market research systems require reliable and repeatable ingestion layers before advanced modeling can be trusted.
@@ -34,25 +34,25 @@ This stage reports visual sanity-check results from CLI-generated plots (source:
 
 In Figure 1, Binance BTCUSDT M1 candles show continuous short-horizon movement without visible timestamp gaps in the sampled window.
 
-![Figure 1. Binance BTCUSDT M1 close/volume plot](docs/figures/plot_outputs/binance_BTCUSDT_1m_close.png)
+[Open Figure 1 plot][plot-binance-btc]
 
 Interpretation: Figure 1 indicates the Binance adapter, timestamp parsing, and plotting path produce coherent minute-level sequencing for BTCUSDT.
 
 In Figure 2, Binance ETHUSDT M1 candles show the same structurally consistent price/volume rendering pattern.
 
-![Figure 2. Binance ETHUSDT M1 close/volume plot](docs/figures/plot_outputs/binance_ETHUSDT_1m_close.png)
+[Open Figure 2 plot][plot-binance-eth]
 
 Interpretation: Figure 2 supports that the same ingestion interface generalizes across multiple symbols on Binance without schema drift.
 
 In Figure 3, Deribit BTCUSDT aliasing to Deribit spot instrument mapping renders a stable M1 series.
 
-![Figure 3. Deribit BTCUSDT (mapped) M1 close/volume plot](docs/figures/plot_outputs/deribit_BTCUSDT_1m_close.png)
+[Open Figure 3 plot][plot-deribit-btc]
 
 Interpretation: Figure 3 confirms symbol normalization and Deribit chart-data normalization preserve a valid minute-candle sequence.
 
 In Figure 4, Deribit ETHUSDT aliasing path similarly yields a continuous M1 chart.
 
-![Figure 4. Deribit ETHUSDT (mapped) M1 close/volume plot](docs/figures/plot_outputs/deribit_ETHUSDT_1m_close.png)
+[Open Figure 4 plot][plot-deribit-eth]
 
 Interpretation: Figure 4 shows consistent behavior across both tracked Deribit spot aliases, reducing integration risk for multi-symbol batch runs.
 
@@ -64,3 +64,8 @@ Step 1 establishes a maintainable multi-exchange ingestion foundation for BTC/ET
 
 ## Appendix
 None for this stage.
+
+[plot-binance-btc]: plots/binance_BTCUSDT_1m_close.png
+[plot-binance-eth]: plots/binance_ETHUSDT_1m_close.png
+[plot-deribit-btc]: plots/deribit_BTCUSDT_1m_close.png
+[plot-deribit-eth]: plots/deribit_ETHUSDT_1m_close.png

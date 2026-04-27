@@ -61,6 +61,7 @@ def save_candle_plots(
 
     try:
         import matplotlib.dates as mdates
+        import matplotlib.patches as mpatches
         import matplotlib.pyplot as plt
         import matplotlib.ticker as mticker
     except ImportError as exc:
@@ -110,16 +111,44 @@ def save_candle_plots(
                 pad=10,
             )
 
-            volume_colors = ["#16a34a"]
+            time_points = mdates.date2num(times)
+            if len(time_points) > 1:
+                deltas = [current - previous for previous, current in zip(time_points, time_points[1:])]
+                median_delta = sorted(deltas)[len(deltas) // 2]
+                bar_width = max(median_delta * 0.58, 0.00005)
+            else:
+                bar_width = 0.0008
+
+            volume_colors = ["#2f9e44"]
             volume_colors.extend(
-                "#16a34a" if current >= previous else "#dc2626"
+                "#2f9e44" if current >= previous else "#c92a2a"
                 for previous, current in zip(prices, prices[1:])
             )
-            volume_axis.bar(times, volumes, color=volume_colors, width=0.004, alpha=0.75)
+            volume_axis.bar(
+                times,
+                volumes,
+                color=volume_colors,
+                width=bar_width,
+                alpha=0.82,
+                linewidth=0.3,
+                edgecolor="#ffffff",
+            )
             volume_axis.set_ylabel("volume", color="#334155")
             volume_axis.yaxis.set_major_formatter(mticker.StrMethodFormatter("{x:,.0f}"))
             volume_axis.set_xlabel("time (UTC)", color="#334155")
             volume_axis.xaxis.set_major_formatter(mdates.DateFormatter("%m.%Y"))
+            volume_axis.legend(
+                handles=[
+                    mpatches.Patch(color="#2f9e44", label="Price up vs previous candle"),
+                    mpatches.Patch(color="#c92a2a", label="Price down vs previous candle"),
+                ],
+                loc="upper left",
+                frameon=True,
+                framealpha=0.9,
+                facecolor="#ffffff",
+                edgecolor="#cbd5e1",
+                fontsize=8,
+            )
 
             figure.autofmt_xdate()
             figure.tight_layout()

@@ -8,7 +8,6 @@ from pathlib import Path
 from ingestion.lake import (
     candle_partition_key,
     candle_record,
-    latest_open_time_in_lake,
     merge_and_deduplicate_rows,
     open_times_in_lake,
     partition_path,
@@ -116,47 +115,6 @@ def test_save_spot_candles_parquet_lake_rewrites_single_partition_file(tmp_path:
     assert files_1 == files_2
     assert len(files_2) == 1
     assert files_2[0].endswith("/data.parquet")
-
-
-def test_latest_open_time_in_lake_returns_max(tmp_path: Path) -> None:
-    candle_1 = SpotCandle(
-        exchange="binance",
-        symbol="BTCUSDT",
-        interval="1m",
-        open_time=datetime(2026, 4, 27, 10, 0, tzinfo=timezone.utc),
-        close_time=datetime(2026, 4, 27, 10, 0, 59, 999000, tzinfo=timezone.utc),
-        open_price=100.0,
-        high_price=101.0,
-        low_price=99.0,
-        close_price=100.5,
-        volume=10.0,
-        quote_volume=1000.0,
-        trade_count=10,
-    )
-    candle_2 = SpotCandle(
-        exchange="binance",
-        symbol="BTCUSDT",
-        interval="1m",
-        open_time=datetime(2026, 4, 27, 10, 1, tzinfo=timezone.utc),
-        close_time=datetime(2026, 4, 27, 10, 1, 59, 999000, tzinfo=timezone.utc),
-        open_price=101.0,
-        high_price=102.0,
-        low_price=100.0,
-        close_price=101.5,
-        volume=11.0,
-        quote_volume=1100.0,
-        trade_count=11,
-    )
-    save_spot_candles_parquet_lake({"binance": {"BTCUSDT": [candle_1, candle_2]}}, "spot", str(tmp_path))
-
-    latest = latest_open_time_in_lake(
-        lake_root=str(tmp_path),
-        market="spot",
-        exchange="binance",
-        symbol="BTCUSDT",
-        timeframe="1m",
-    )
-    assert latest == candle_2.open_time
 
 
 def test_open_times_in_lake_returns_sorted_unique(tmp_path: Path) -> None:

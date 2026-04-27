@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import concurrent.futures
 from collections import defaultdict
 from dataclasses import asdict
 from datetime import datetime, timezone
@@ -99,43 +100,6 @@ def merge_and_deduplicate_rows(existing: list[dict[str, object]], new: list[dict
     return rows
 
 
-def latest_open_time_in_lake(
-    lake_root: str,
-    market: str,
-    exchange: str,
-    symbol: str,
-    timeframe: str,
-) -> datetime | None:
-    """Return latest stored open_time for one instrument/timeframe parquet file, if present."""
-
-    try:
-        import pyarrow.parquet as pq
-    except ImportError as exc:
-        raise RuntimeError("pyarrow is required for parquet lake output. Install project dependencies.") from exc
-
-    dataset_type = "spot_ohlcv" if market == "spot" else "perp_ohlcv"
-    base = (
-        Path(lake_root)
-        / f"dataset_type={dataset_type}"
-        / f"exchange={exchange}"
-        / f"symbol={symbol}"
-        / f"timeframe={timeframe}"
-    )
-    if not base.exists():
-        return None
-
-    data_file = base / "data.parquet"
-    if not data_file.exists():
-        return None
-
-    latest: datetime | None = None
-    table = pq.ParquetFile(data_file).read(columns=["open_time"])
-    for value in table.column("open_time").to_pylist():
-        if isinstance(value, datetime) and (latest is None or value > latest):
-            latest = value
-    return latest
-
-
 def open_times_in_lake(
     lake_root: str,
     market: str,
@@ -204,8 +168,7 @@ def save_spot_candles_parquet_lake(
                 key = candle_partition_key(candle)
                 grouped[key].append(candle_record(candle=candle, market=market, run_id=run_id, ingested_at=ingested_at))
 
-    written_files: list[str] = []
-    for key, rows in grouped.items():
+    def _write_one_partition(key: PartitionKey, rows: list[dict[str, object]]) -> str:
         part_dir = partition_path(lake_root=lake_root, dataset_type=dataset_type, key=key)
         part_dir.mkdir(parents=True, exist_ok=True)
         file_path = part_dir / "data.parquet"
@@ -220,6 +183,14 @@ def save_spot_candles_parquet_lake(
         table = pa.Table.from_pylist(merged_rows)
         pq.write_table(table, staging_path)
         staging_path.replace(file_path)
-        written_files.append(str(file_path.resolve()))
+        return str(file_path.resolve())
+
+    written_files: list[str] = []
+    if grouped:
+        max_workers = min(4, len(grouped))
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = [executor.submit(_write_one_partition, key, rows) for key, rows in grouped.items()]
+            for future in concurrent.futures.as_completed(futures):
+                written_files.append(future.result())
 
     return sorted(written_files)

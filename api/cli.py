@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import fcntl
 import json
+import logging
 import os
 from dataclasses import asdict
 from datetime import datetime, timezone
+from logging.handlers import TimedRotatingFileHandler
 from pathlib import Path
 from typing import Literal, cast
 
@@ -26,8 +29,11 @@ from ingestion.spot import (
     normalize_storage_symbol,
     normalize_timeframe,
 )
+from ingestion.timescaledb_loader import ingest_parquet_to_timescaledb, load_timescale_config_from_env
 
 FetchMode = Literal["latest", "gap-fill"]
+LOGGER_NAME = "l2_synchronizer"
+DEFAULT_LOG_DIR = "/volume1/Temp/logs"
 
 
 class SingleInstanceError(RuntimeError):
@@ -62,6 +68,39 @@ class SingleInstanceLock:
         fcntl.flock(self._fd, fcntl.LOCK_UN)
         os.close(self._fd)
         self._fd = None
+
+
+def _configure_logging() -> logging.Logger:
+    """Configure file logging with weekly rotation."""
+
+    logger = logging.getLogger(LOGGER_NAME)
+    if logger.handlers:
+        return logger
+
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+    formatter = logging.Formatter("%(asctime)s %(levelname)s %(message)s")
+    log_dir = Path(os.getenv("L2_SYNC_LOG_DIR", DEFAULT_LOG_DIR))
+    try:
+        log_dir.mkdir(parents=True, exist_ok=True)
+        file_handler = TimedRotatingFileHandler(
+            filename=log_dir / "l2-synchronizer.log",
+            when="D",
+            interval=7,
+            backupCount=0,
+            encoding="utf-8",
+            utc=True,
+        )
+        file_handler.suffix = "%Y-%m-%d"
+        file_handler.setFormatter(formatter)
+        logger.addHandler(file_handler)
+    except OSError:
+        stream_handler = logging.StreamHandler()
+        stream_handler.setFormatter(formatter)
+        logger.addHandler(stream_handler)
+        logger.warning("Falling back to stderr logging; cannot create log directory '%s'", log_dir)
+
+    return logger
 
 
 
@@ -228,6 +267,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Candle timeframe, e.g. M1, M5, H1, D1, 1m, 1h, 1d",
     )
     spot_parser.add_argument(
+        "--timeframes",
+        nargs="+",
+        help="Optional list of timeframes. When set, fetch runs for each timeframe in parallel.",
+    )
+    spot_parser.add_argument(
         "--limit",
         type=int,
         default=None,
@@ -277,6 +321,33 @@ def build_parser() -> argparse.ArgumentParser:
         help="Optional list of exchanges to list in one run",
     )
 
+    ingest_parser = subparsers.add_parser(
+        "ingest-parquet-to-db",
+        help="Ingest parquet lake files into TimescaleDB",
+    )
+    ingest_parser.add_argument(
+        "--lake-root",
+        default="lake/bronze",
+        help="Root directory for parquet lake files",
+    )
+    ingest_parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=1000,
+        help="Upsert batch size for database inserts",
+    )
+    ingest_parser.add_argument(
+        "--dataset-types",
+        nargs="+",
+        choices=["spot_ohlcv", "perp_ohlcv"],
+        help="Optional dataset type filter",
+    )
+    ingest_parser.add_argument(
+        "--no-json-output",
+        action="store_true",
+        help="Suppress JSON output from ingest-parquet-to-db command",
+    )
+
     return parser
 
 
@@ -284,10 +355,12 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> None:
     """CLI entrypoint."""
 
+    logger = _configure_logging()
     try:
         with SingleInstanceLock(".run/l2-synchronizer.lock"):
             parser = build_parser()
             args = parser.parse_args()
+            logger.info("Command start: %s", args.command)
 
             if args.command == "fetch-spot":
                 if args.all_history and args.limit is not None:
@@ -295,6 +368,8 @@ def main() -> None:
                 exchanges = cast(list[Exchange], args.exchanges if args.exchanges else [args.exchange])
                 mode = cast(FetchMode, args.mode)
                 market = cast(Market, args.market)
+                requested_timeframes = cast(list[str], args.timeframes if args.timeframes else [args.timeframe])
+                multi_timeframe = len(requested_timeframes) > 1
                 if args.all_history:
                     effective_mode = "all-history"
                 elif args.limit is not None:
@@ -303,35 +378,79 @@ def main() -> None:
                     effective_mode = mode
                 output: dict[str, object] = {"_effective_mode": effective_mode}
                 candles_for_plots: dict[str, dict[str, list[SpotCandle]]] = {}
+                tasks: list[tuple[Exchange, str, str]] = []
 
                 for exchange in exchanges:
                     exchange_output: dict[str, object] = {}
-                    exchange_candles: dict[str, list[SpotCandle]] = {}
-                    try:
-                        timeframe = normalize_timeframe(exchange=exchange, value=args.timeframe)
-                        for symbol in args.symbols:
-                            try:
-                                candles = _fetch_symbol_candles(
-                                    exchange=exchange,
-                                    market=market,
-                                    symbol=symbol,
-                                    timeframe=timeframe,
-                                    limit=args.limit,
-                                    all_history=args.all_history,
-                                    mode=mode,
-                                    lake_root=args.lake_root,
-                                )
-                                symbol_key = symbol.upper()
-                                exchange_output[symbol_key] = [_serialize_candle(item) for item in candles]
-                                exchange_candles[symbol_key] = candles
-                            except Exception as exc:  # noqa: BLE001
-                                exchange_output[symbol.upper()] = {"error": str(exc)}
-                    except Exception as exc:  # noqa: BLE001
-                        exchange_output["_exchange_error"] = str(exc)
-
                     output[exchange] = exchange_output
-                    if exchange_candles:
-                        candles_for_plots[exchange] = exchange_candles
+                    normalized_timeframes: list[str] = []
+                    for timeframe_value in requested_timeframes:
+                        try:
+                            normalized_timeframes.append(
+                                normalize_timeframe(exchange=exchange, value=timeframe_value)
+                            )
+                        except Exception as exc:  # noqa: BLE001
+                            exchange_output[f"_timeframe_error_{timeframe_value}"] = str(exc)
+                            logger.exception(
+                                "Failed to normalize timeframe exchange=%s timeframe=%s",
+                                exchange,
+                                timeframe_value,
+                            )
+                    if not normalized_timeframes:
+                        continue
+                    for timeframe in normalized_timeframes:
+                        for symbol in args.symbols:
+                            tasks.append((exchange, symbol, timeframe))
+
+                task_results: dict[tuple[Exchange, str, str], list[SpotCandle]] = {}
+                task_errors: dict[tuple[Exchange, str, str], str] = {}
+                if tasks:
+                    max_workers = min(8, len(tasks))
+                    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+                        future_to_task = {
+                            executor.submit(
+                                _fetch_symbol_candles,
+                                exchange=exchange,
+                                market=market,
+                                symbol=symbol,
+                                timeframe=timeframe,
+                                limit=args.limit,
+                                all_history=args.all_history,
+                                mode=mode,
+                                lake_root=args.lake_root,
+                            ): (exchange, symbol, timeframe)
+                            for exchange, symbol, timeframe in tasks
+                        }
+                        for future in concurrent.futures.as_completed(future_to_task):
+                            exchange, symbol, timeframe = future_to_task[future]
+                            key = (exchange, symbol, timeframe)
+                            try:
+                                task_results[key] = future.result()
+                            except Exception as exc:  # noqa: BLE001
+                                task_errors[key] = str(exc)
+                                logger.exception(
+                                    "Fetch failed exchange=%s symbol=%s timeframe=%s",
+                                    exchange,
+                                    symbol,
+                                    timeframe,
+                                )
+
+                for exchange, symbol, timeframe in tasks:
+                    exchange_output = cast(dict[str, object], output[exchange])
+                    symbol_key = symbol.upper()
+                    result_key = (exchange, symbol, timeframe)
+                    if multi_timeframe:
+                        timeframe_bucket = cast(dict[str, object], exchange_output.setdefault(timeframe, {}))
+                    else:
+                        timeframe_bucket = exchange_output
+                    if result_key in task_errors:
+                        timeframe_bucket[symbol_key] = {"error": task_errors[result_key]}
+                        continue
+                    candles = task_results.get(result_key, [])
+                    timeframe_bucket[symbol_key] = [_serialize_candle(item) for item in candles]
+                    exchange_candles = candles_for_plots.setdefault(exchange, {})
+                    plot_key = f"{symbol_key}__{timeframe}" if multi_timeframe else symbol_key
+                    exchange_candles[plot_key] = candles
 
                 if args.plot:
                     try:
@@ -343,6 +462,7 @@ def main() -> None:
                         output["_plots"] = saved_paths
                     except Exception as exc:  # noqa: BLE001
                         output["_plot_error"] = str(exc)
+                        logger.exception("Plot generation failed")
 
                 if args.save_parquet_lake:
                     try:
@@ -354,16 +474,37 @@ def main() -> None:
                         output["_parquet_files"] = parquet_files
                     except Exception as exc:  # noqa: BLE001
                         output["_parquet_error"] = str(exc)
+                        logger.exception("Parquet lake write failed")
 
                 if not args.no_json_output:
                     print(json.dumps(output, indent=2))
+                logger.info("Command complete: fetch-spot")
 
             elif args.command == "list-spot-timeframes":
                 exchanges = cast(list[Exchange], args.exchanges if args.exchanges else [args.exchange])
                 output = {exchange: list(list_supported_intervals(exchange=exchange)) for exchange in exchanges}
                 print(json.dumps(output, indent=2))
+                logger.info("Command complete: list-spot-timeframes")
+
+            elif args.command == "ingest-parquet-to-db":
+                config = load_timescale_config_from_env()
+                summary = ingest_parquet_to_timescaledb(
+                    lake_root=args.lake_root,
+                    config=config,
+                    batch_size=args.batch_size,
+                    dataset_types=cast(list[str] | None, args.dataset_types),
+                )
+                if not args.no_json_output:
+                    print(json.dumps(summary, indent=2))
+                logger.info(
+                    "Command complete: ingest-parquet-to-db files_scanned=%s files_ingested=%s rows_upserted=%s",
+                    summary.get("files_scanned", 0),
+                    summary.get("files_ingested", 0),
+                    summary.get("rows_upserted", 0),
+                )
 
     except SingleInstanceError as exc:
+        logger.warning("Single-instance lock active")
         raise SystemExit(str(exc)) from exc
 
 

@@ -151,6 +151,29 @@ def test_fetch_deribit_candles_respects_limit(monkeypatch: pytest.MonkeyPatch) -
     assert [int(item.open_time.timestamp()) for item in candles] == [2, 3, 4]
 
 
+def test_fetch_binance_perp_routes_to_futures_endpoint(monkeypatch: pytest.MonkeyPatch) -> None:
+    from ingestion.exchanges import binance as binance_exchange
+
+    calls: list[str] = []
+
+    def fake_get_json(url: str, params: dict[str, object] | None = None, timeout_s: float = 15.0) -> object:
+        del timeout_s
+        calls.append(url)
+        assert params is not None
+        assert params["symbol"] == "BTCUSDT"
+        return [
+            [1000, "1", "2", "0.5", "1.5", "10", 1999, "15", 2, "0", "0", "0"],
+            [2000, "1.5", "2.2", "1.0", "2.0", "12", 2999, "20", 3, "0", "0", "0"],
+        ]
+
+    monkeypatch.setattr(binance_exchange, "get_json", fake_get_json)
+    candles = fetch_candles(exchange="binance", market="perp", symbol="BTC", interval="1m", limit=2)
+
+    assert len(candles) == 2
+    assert calls[0] == "https://fapi.binance.com/fapi/v1/klines"
+    assert candles[0].symbol == "BTCUSDT"
+
+
 def test_fetch_all_history_routes_to_exchange_all_fetch(monkeypatch: pytest.MonkeyPatch) -> None:
     from ingestion.exchanges import deribit as deribit_exchange
 

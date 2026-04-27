@@ -25,6 +25,8 @@ BINANCE_SUPPORTED_INTERVALS: tuple[str, ...] = (
     "1M",
 )
 BINANCE_MAX_KLINES_PER_REQUEST = 1000
+BINANCE_SPOT_KLINES_URL = "https://api.binance.com/api/v3/klines"
+BINANCE_PERP_KLINES_URL = "https://fapi.binance.com/fapi/v1/klines"
 
 
 
@@ -90,9 +92,22 @@ def normalize_timeframe(value: str) -> str:
         f"Supported values: {', '.join(BINANCE_SUPPORTED_INTERVALS)}"
     )
 
+def normalize_symbol(symbol: str, market: str) -> str:
+    """Normalize user symbols for Binance spot/perpetual markets."""
+
+    upper = symbol.upper()
+    if market == "spot":
+        return upper
+    if market == "perp":
+        if upper in {"BTC", "BTCUSDT"}:
+            return "BTCUSDT"
+        if upper in {"ETH", "ETHUSDT"}:
+            return "ETHUSDT"
+        return upper
+    raise ValueError("market must be either 'spot' or 'perp'")
 
 
-def fetch_klines(symbol: str, interval: str, limit: int) -> list[list[object]]:
+def fetch_klines(symbol: str, interval: str, limit: int, market: str = "spot") -> list[list[object]]:
     """Fetch Binance klines with pagination for large limits."""
 
     if limit <= 0:
@@ -109,6 +124,7 @@ def fetch_klines(symbol: str, interval: str, limit: int) -> list[list[object]]:
             interval=interval,
             limit=page_limit,
             end_time_ms=end_time_ms,
+            market=market,
         )
         if not page:
             break
@@ -126,7 +142,7 @@ def fetch_klines(symbol: str, interval: str, limit: int) -> list[list[object]]:
 
 
 
-def fetch_klines_all(symbol: str, interval: str) -> list[list[object]]:
+def fetch_klines_all(symbol: str, interval: str, market: str = "spot") -> list[list[object]]:
     """Fetch all available Binance klines by paging backward until exhaustion."""
 
     end_time_ms: int | None = None
@@ -138,6 +154,7 @@ def fetch_klines_all(symbol: str, interval: str) -> list[list[object]]:
             interval=interval,
             limit=BINANCE_MAX_KLINES_PER_REQUEST,
             end_time_ms=end_time_ms,
+            market=market,
         )
         if not page:
             break
@@ -161,7 +178,13 @@ def fetch_klines_all(symbol: str, interval: str) -> list[list[object]]:
     return [dedup[key] for key in sorted(dedup)]
 
 
-def fetch_klines_range(symbol: str, interval: str, start_open_ms: int, end_open_ms: int) -> list[list[object]]:
+def fetch_klines_range(
+    symbol: str,
+    interval: str,
+    start_open_ms: int,
+    end_open_ms: int,
+    market: str = "spot",
+) -> list[list[object]]:
     """Fetch Binance klines in a forward time range inclusive by open time."""
 
     if end_open_ms < start_open_ms:
@@ -178,6 +201,7 @@ def fetch_klines_range(symbol: str, interval: str, start_open_ms: int, end_open_
             limit=BINANCE_MAX_KLINES_PER_REQUEST,
             start_time_ms=cursor,
             end_time_ms=end_open_ms + interval_ms - 1,
+            market=market,
         )
         if not page:
             break
@@ -213,6 +237,7 @@ def _fetch_klines_page(
     limit: int,
     end_time_ms: int | None,
     start_time_ms: int | None = None,
+    market: str = "spot",
 ) -> list[list[object]]:
     """Fetch one page of klines from Binance."""
 
@@ -222,7 +247,14 @@ def _fetch_klines_page(
     if end_time_ms is not None:
         params["endTime"] = end_time_ms
 
-    payload = get_json("https://api.binance.com/api/v3/klines", params=params)
+    if market == "spot":
+        endpoint = BINANCE_SPOT_KLINES_URL
+    elif market == "perp":
+        endpoint = BINANCE_PERP_KLINES_URL
+    else:
+        raise ValueError("market must be either 'spot' or 'perp'")
+
+    payload = get_json(endpoint, params=params)
     if not isinstance(payload, list):
         raise ValueError("Unexpected Binance response format")
     return payload
