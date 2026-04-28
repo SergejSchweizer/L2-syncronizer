@@ -479,3 +479,49 @@ def test_main_export_df_reports_generated_file_time_ranges(
     assert generated[0]["symbol"] == "BTCUSDT"
     assert generated[0]["start_open_time"] == "2026-04-27T10:00:00+00:00"
     assert generated[0]["end_open_time"] == "2026-04-27T10:01:00+00:00"
+
+
+def test_main_export_df_no_fallback_when_result_is_empty(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    empty = pd.DataFrame(
+        columns=[
+            "exchange",
+            "instrument_type",
+            "symbol",
+            "timeframe",
+            "open_time",
+            "close_time",
+            "open",
+            "high",
+            "low",
+            "close",
+            "volume",
+            "quote_volume",
+            "trade_count",
+        ]
+    )
+    output_dir = tmp_path / "exports"
+    monkeypatch.setattr(cli, "load_combined_dataframe_from_lake", lambda **kwargs: empty)
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "main.py",
+            "export-df",
+            "--output",
+            str(output_dir),
+            "--format",
+            "csv",
+        ],
+    )
+
+    cli.main()
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["groups"] == 0
+    assert payload["generated_files"] == []
+    assert payload["outputs"] == []
+    assert payload["plots"] == []
+    assert not list(output_dir.glob("*"))

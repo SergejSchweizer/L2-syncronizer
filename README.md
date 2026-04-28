@@ -240,6 +240,7 @@ with the same base name and `.png` extension.
 If `--output` is omitted, files are written to `/volume1/Temp/crypto`.
 The export JSON summary includes extended per-file metadata in `generated_files`
 (data file path, plot file path, row count, and start/end `open_time` range).
+If export result is empty after filters/time range, no fallback file is created.
 
 Examples:
 - `binance_BTCUSDT_1m_full.csv`

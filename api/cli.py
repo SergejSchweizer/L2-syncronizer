@@ -224,21 +224,6 @@ def _parse_iso_datetime(value: str | None) -> datetime | None:
     return datetime.fromisoformat(normalized)
 
 
-def _default_export_filename(
-    exchanges: list[str] | None,
-    symbols: list[str] | None,
-    timeframes: list[str] | None,
-    file_format: str,
-) -> str:
-    """Build default export filename from requested data scope."""
-
-    exchange_part = exchanges[0].lower() if exchanges and len(exchanges) == 1 else "multi"
-    symbol_part = symbols[0].upper() if symbols and len(symbols) == 1 else "multi"
-    timeframe_part = timeframes[0].lower() if timeframes and len(timeframes) == 1 else "multi"
-    extension = "parquet" if file_format == "parquet" else "csv"
-    return f"{exchange_part}_{symbol_part}_{timeframe_part}_full.{extension}"
-
-
 def _grouped_export_filename(exchange: str, symbol: str, timeframe: str, file_format: str) -> str:
     """Build export filename for one exchange/symbol/timeframe group."""
 
@@ -691,39 +676,13 @@ def main() -> None:
             )
             group_count += 1
 
-        if group_count == 0:
-            fallback_name = _default_export_filename(
-                exchanges=cast(list[str] | None, args.exchanges),
-                symbols=cast(list[str] | None, args.symbols),
-                timeframes=cast(list[str] | None, args.timeframes),
-                file_format=cast(str, args.format),
-            )
-            output_path = output_dir / fallback_name
-            if args.format == "parquet":
-                dataframe.to_parquet(output_path, index=False)
-            else:
-                dataframe.to_csv(output_path, index=False)
-            output_paths.append(str(output_path.resolve()))
-            generated_files.append(
-                {
-                    "exchange": None,
-                    "symbol": None,
-                    "timeframe": None,
-                    "data_file": str(output_path.resolve()),
-                    "plot_file": None,
-                    "rows": int(getattr(dataframe, "shape", (0, 0))[0]),
-                    "start_open_time": None,
-                    "end_open_time": None,
-                }
-            )
-
         export_summary: dict[str, object] = {
             "output_dir": str(output_dir.resolve()),
             "outputs": output_paths,
             "plots": plot_paths,
             "generated_files": generated_files,
             "format": args.format,
-            "groups": group_count if group_count > 0 else 1,
+            "groups": group_count,
             "rows": int(getattr(dataframe, "shape", (0, 0))[0]),
             "columns": list(getattr(dataframe, "columns", [])),
         }
