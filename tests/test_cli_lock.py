@@ -3,15 +3,15 @@
 from __future__ import annotations
 
 import fcntl
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
+from typing import cast
 
 import pytest
 
 from api import cli
 from api.cli import SingleInstanceError, SingleInstanceLock
 from ingestion.spot import SpotCandle
-
 
 
 def test_single_instance_lock_creates_lock_file(tmp_path: Path) -> None:
@@ -21,7 +21,6 @@ def test_single_instance_lock_creates_lock_file(tmp_path: Path) -> None:
         assert lock_file.exists()
         content = lock_file.read_text().strip()
         assert content.isdigit()
-
 
 
 def test_single_instance_lock_raises_on_contention(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -45,8 +44,8 @@ def test_gap_fill_bootstraps_when_no_lake_data(monkeypatch: pytest.MonkeyPatch) 
         exchange="binance",
         symbol="BTCUSDT",
         interval="1m",
-        open_time=datetime(2026, 4, 27, 10, 0, tzinfo=timezone.utc),
-        close_time=datetime(2026, 4, 27, 10, 0, 59, 999000, tzinfo=timezone.utc),
+        open_time=datetime(2026, 4, 27, 10, 0, tzinfo=UTC),
+        close_time=datetime(2026, 4, 27, 10, 0, 59, 999000, tzinfo=UTC),
         open_price=100.0,
         high_price=101.0,
         low_price=99.0,
@@ -83,11 +82,11 @@ def test_gap_fill_bootstraps_when_no_lake_data(monkeypatch: pytest.MonkeyPatch) 
 def test_gap_fill_fetches_internal_and_tail_gaps(monkeypatch: pytest.MonkeyPatch) -> None:
     interval_ms = 60_000
     open_times = [
-        datetime(2026, 4, 27, 10, 0, tzinfo=timezone.utc),
-        datetime(2026, 4, 27, 10, 2, tzinfo=timezone.utc),
-        datetime(2026, 4, 27, 10, 3, tzinfo=timezone.utc),
+        datetime(2026, 4, 27, 10, 0, tzinfo=UTC),
+        datetime(2026, 4, 27, 10, 2, tzinfo=UTC),
+        datetime(2026, 4, 27, 10, 3, tzinfo=UTC),
     ]
-    end_open_ms = int(datetime(2026, 4, 27, 10, 5, tzinfo=timezone.utc).timestamp() * 1000)
+    end_open_ms = int(datetime(2026, 4, 27, 10, 5, tzinfo=UTC).timestamp() * 1000)
     calls: list[tuple[int, int]] = []
 
     monkeypatch.setattr(cli, "open_times_in_lake", lambda **kwargs: open_times)
@@ -96,7 +95,9 @@ def test_gap_fill_fetches_internal_and_tail_gaps(monkeypatch: pytest.MonkeyPatch
     monkeypatch.setattr(cli, "_last_closed_open_ms", lambda **kwargs: end_open_ms)
 
     def fake_fetch_candles_range(**kwargs: object) -> list[SpotCandle]:
-        calls.append((int(kwargs["start_open_ms"]), int(kwargs["end_open_ms"])))
+        start_open_ms = cast(int, kwargs["start_open_ms"])
+        end_open_ms = cast(int, kwargs["end_open_ms"])
+        calls.append((start_open_ms, end_open_ms))
         return []
 
     monkeypatch.setattr(cli, "fetch_candles_range", fake_fetch_candles_range)
@@ -112,8 +113,8 @@ def test_gap_fill_fetches_internal_and_tail_gaps(monkeypatch: pytest.MonkeyPatch
         lake_root="lake/bronze",
     )
 
-    gap_one_ms = int(datetime(2026, 4, 27, 10, 1, tzinfo=timezone.utc).timestamp() * 1000)
-    gap_tail_start_ms = int(datetime(2026, 4, 27, 10, 4, tzinfo=timezone.utc).timestamp() * 1000)
+    gap_one_ms = int(datetime(2026, 4, 27, 10, 1, tzinfo=UTC).timestamp() * 1000)
+    gap_tail_start_ms = int(datetime(2026, 4, 27, 10, 4, tzinfo=UTC).timestamp() * 1000)
     assert candles == []
     assert calls == [(gap_one_ms, gap_one_ms), (gap_tail_start_ms, end_open_ms)]
 
@@ -123,8 +124,8 @@ def test_all_history_mode_uses_all_history_fetch(monkeypatch: pytest.MonkeyPatch
         exchange="binance",
         symbol="BTCUSDT",
         interval="1m",
-        open_time=datetime(2026, 4, 27, 10, 0, tzinfo=timezone.utc),
-        close_time=datetime(2026, 4, 27, 10, 0, 59, 999000, tzinfo=timezone.utc),
+        open_time=datetime(2026, 4, 27, 10, 0, tzinfo=UTC),
+        close_time=datetime(2026, 4, 27, 10, 0, 59, 999000, tzinfo=UTC),
         open_price=100.0,
         high_price=101.0,
         low_price=99.0,
@@ -177,7 +178,12 @@ def test_main_ingest_command_does_not_acquire_single_instance_lock(
     monkeypatch.setattr(
         cli,
         "ingest_parquet_to_timescaledb",
-        lambda **kwargs: {"files_scanned": 0, "files_ingested": 0, "rows_upserted": 0, "files_skipped": 0},
+        lambda **kwargs: {
+            "files_scanned": 0,
+            "files_ingested": 0,
+            "rows_upserted": 0,
+            "files_skipped": 0,
+        },
     )
     monkeypatch.setattr(
         "sys.argv",
@@ -187,13 +193,15 @@ def test_main_ingest_command_does_not_acquire_single_instance_lock(
     cli.main()
 
 
-def test_main_fetcher_command_still_uses_single_instance_lock(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_main_loader_command_still_uses_single_instance_lock(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     class Locked:
         def __init__(self, lock_path: str) -> None:
             del lock_path
 
         def __enter__(self) -> None:
-            raise SingleInstanceError("fetcher already running")
+            raise SingleInstanceError("loader already running")
 
         def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
             del exc_type, exc, tb
@@ -203,7 +211,7 @@ def test_main_fetcher_command_still_uses_single_instance_lock(monkeypatch: pytes
         "sys.argv",
         [
             "main.py",
-            "fetcher",
+            "loader",
             "--exchange",
             "binance",
             "--market",
@@ -218,7 +226,7 @@ def test_main_fetcher_command_still_uses_single_instance_lock(monkeypatch: pytes
         ],
     )
 
-    with pytest.raises(SystemExit, match="fetcher already running"):
+    with pytest.raises(SystemExit, match="loader already running"):
         cli.main()
 
 

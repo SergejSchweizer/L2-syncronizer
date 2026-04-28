@@ -8,7 +8,7 @@ import json
 import logging
 import os
 from dataclasses import asdict
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from logging.handlers import TimedRotatingFileHandler
 from pathlib import Path
 from typing import Literal, cast
@@ -39,7 +39,7 @@ from ingestion.timescaledb_loader import (
 )
 
 FetchMode = Literal["latest", "gap-fill"]
-LOGGER_NAME = "crypto_l2_fetcher"
+LOGGER_NAME = "crypto_l2_loader"
 DEFAULT_LOG_DIR = "/volume1/Temp/logs"
 
 
@@ -54,7 +54,7 @@ class SingleInstanceLock:
         self.lock_path = Path(lock_path)
         self._fd: int | None = None
 
-    def __enter__(self) -> "SingleInstanceLock":
+    def __enter__(self) -> SingleInstanceLock:
         self.lock_path.parent.mkdir(parents=True, exist_ok=True)
         self._fd = os.open(self.lock_path, os.O_CREAT | os.O_RDWR, 0o644)
         try:
@@ -62,9 +62,7 @@ class SingleInstanceLock:
         except BlockingIOError as exc:
             os.close(self._fd)
             self._fd = None
-            raise SingleInstanceError(
-                "Another crypto-l2-fetcher instance is already running. Exiting."
-            ) from exc
+            raise SingleInstanceError("Another crypto-l2-loader instance is already running. Exiting.") from exc
         os.ftruncate(self._fd, 0)
         os.write(self._fd, str(os.getpid()).encode("utf-8"))
         return self
@@ -91,7 +89,7 @@ def _configure_logging() -> logging.Logger:
     try:
         log_dir.mkdir(parents=True, exist_ok=True)
         file_handler = TimedRotatingFileHandler(
-            filename=log_dir / "crypto-l2-fetcher.log",
+            filename=log_dir / "crypto-l2-loader.log",
             when="D",
             interval=7,
             backupCount=0,
@@ -110,7 +108,6 @@ def _configure_logging() -> logging.Logger:
     return logger
 
 
-
 def _serialize_candle(candle: SpotCandle) -> dict[str, object]:
     """Convert a ``SpotCandle`` into JSON-safe dictionary."""
 
@@ -122,11 +119,10 @@ def _serialize_candle(candle: SpotCandle) -> dict[str, object]:
     return data
 
 
-
 def _last_closed_open_ms(interval_ms: int, now_utc: datetime | None = None) -> int:
     """Return open timestamp (ms) of latest fully closed candle."""
 
-    now = now_utc or datetime.now(timezone.utc)
+    now = now_utc or datetime.now(UTC)
     now_ms = int(now.timestamp() * 1000)
     return ((now_ms // interval_ms) - 1) * interval_ms
 
@@ -149,7 +145,7 @@ def _missing_ranges_ms(
         return []
 
     ranges: list[tuple[int, int]] = []
-    for previous, current in zip(existing_ms, existing_ms[1:]):
+    for previous, current in zip(existing_ms, existing_ms[1:], strict=False):
         gap_start_ms = previous + interval_ms
         gap_end_ms = current - interval_ms
         if gap_start_ms <= gap_end_ms:
@@ -160,7 +156,6 @@ def _missing_ranges_ms(
         ranges.append((last_existing_ms + interval_ms, end_open_ms))
 
     return ranges
-
 
 
 def _fetch_symbol_candles(
@@ -255,14 +250,13 @@ def _parse_iso_datetime(value: str | None) -> datetime | None:
     return datetime.fromisoformat(normalized)
 
 
-
 def build_parser() -> argparse.ArgumentParser:
     """Create top-level CLI parser."""
 
-    parser = argparse.ArgumentParser(description="crypto-l2-fetcher CLI")
+    parser = argparse.ArgumentParser(description="crypto-l2-loader CLI")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    spot_parser = subparsers.add_parser("fetcher", help="Fetch candles from supported exchanges")
+    spot_parser = subparsers.add_parser("loader", help="Fetch candles from supported exchanges")
     spot_parser.add_argument("--exchange", choices=["binance", "deribit", "bybit"], default="binance")
     spot_parser.add_argument(
         "--exchanges",
@@ -270,7 +264,13 @@ def build_parser() -> argparse.ArgumentParser:
         choices=["binance", "deribit", "bybit"],
         help="Optional list of exchanges to fetch in one run",
     )
-    spot_parser.add_argument("--market", choices=["spot", "perp"], default="spot")
+    spot_parser.add_argument(
+        "--market",
+        nargs="+",
+        choices=["spot", "perp"],
+        default=["spot"],
+        help="One or more markets to fetch, e.g. --market spot perp",
+    )
     spot_parser.add_argument(
         "--symbols",
         nargs="+",
@@ -287,7 +287,7 @@ def build_parser() -> argparse.ArgumentParser:
     spot_parser.add_argument(
         "--timeframes",
         nargs="+",
-        help="Optional list of timeframes. When set, fetch runs for each timeframe in parallel.",
+        help="Optional list of timeframes. When set, fetch runs for each timeframe sequentially.",
     )
     spot_parser.add_argument(
         "--limit",
@@ -327,7 +327,7 @@ def build_parser() -> argparse.ArgumentParser:
     spot_parser.add_argument(
         "--no-json-output",
         action="store_true",
-        help="Suppress JSON output from fetcher command",
+        help="Suppress JSON output from loader command",
     )
 
     tf_parser = subparsers.add_parser("list-spot-timeframes", help="List exchange-supported candle timeframes")
@@ -427,7 +427,6 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-
 def main() -> None:
     """CLI entrypoint."""
 
@@ -436,14 +435,15 @@ def main() -> None:
     args = parser.parse_args()
     logger.info("Command start: %s", args.command)
 
-    if args.command == "fetcher":
+    if args.command == "loader":
         try:
-            with SingleInstanceLock(".run/crypto-l2-fetcher.lock"):
+            with SingleInstanceLock(".run/crypto-l2-loader.lock"):
                 if args.all_history and args.limit is not None:
                     parser.error("--all-history cannot be combined with --limit")
                 exchanges = cast(list[Exchange], args.exchanges if args.exchanges else [args.exchange])
                 mode = cast(FetchMode, args.mode)
-                market = cast(Market, args.market)
+                markets = cast(list[Market], args.market)
+                multi_market = len(markets) > 1
                 requested_timeframes = cast(list[str], args.timeframes if args.timeframes else [args.timeframe])
                 multi_timeframe = len(requested_timeframes) > 1
                 if args.all_history:
@@ -453,8 +453,8 @@ def main() -> None:
                 else:
                     effective_mode = mode
                 output: dict[str, object] = {"_effective_mode": effective_mode}
-                candles_for_plots: dict[str, dict[str, list[SpotCandle]]] = {}
-                tasks: list[tuple[Exchange, str, str]] = []
+                candles_for_storage: dict[Market, dict[str, dict[str, list[SpotCandle]]]] = {}
+                tasks: list[tuple[Exchange, Market, str, str]] = []
 
                 for exchange in exchanges:
                     exchange_output: dict[str, object] = {}
@@ -462,9 +462,7 @@ def main() -> None:
                     normalized_timeframes: list[str] = []
                     for timeframe_value in requested_timeframes:
                         try:
-                            normalized_timeframes.append(
-                                normalize_timeframe(exchange=exchange, value=timeframe_value)
-                            )
+                            normalized_timeframes.append(normalize_timeframe(exchange=exchange, value=timeframe_value))
                         except Exception as exc:  # noqa: BLE001
                             exchange_output[f"_timeframe_error_{timeframe_value}"] = str(exc)
                             logger.exception(
@@ -474,14 +472,15 @@ def main() -> None:
                             )
                     if not normalized_timeframes:
                         continue
-                    for timeframe in normalized_timeframes:
-                        for symbol in args.symbols:
-                            tasks.append((exchange, symbol, timeframe))
+                    for market in markets:
+                        for timeframe in normalized_timeframes:
+                            for symbol in args.symbols:
+                                tasks.append((exchange, market, symbol, timeframe))
 
-                task_results: dict[tuple[Exchange, str, str], list[SpotCandle]] = {}
-                task_errors: dict[tuple[Exchange, str, str], str] = {}
-                for exchange, symbol, timeframe in tasks:
-                    key = (exchange, symbol, timeframe)
+                task_results: dict[tuple[Exchange, Market, str, str], list[SpotCandle]] = {}
+                task_errors: dict[tuple[Exchange, Market, str, str], str] = {}
+                for exchange, market, symbol, timeframe in tasks:
+                    key = (exchange, market, symbol, timeframe)
                     try:
                         task_results[key] = _fetch_symbol_candles(
                             exchange=exchange,
@@ -496,36 +495,53 @@ def main() -> None:
                     except Exception as exc:  # noqa: BLE001
                         task_errors[key] = str(exc)
                         logger.exception(
-                            "Fetch failed exchange=%s symbol=%s timeframe=%s",
+                            "Fetch failed exchange=%s market=%s symbol=%s timeframe=%s",
                             exchange,
+                            market,
                             symbol,
                             timeframe,
                         )
 
-                for exchange, symbol, timeframe in tasks:
+                for exchange, market, symbol, timeframe in tasks:
                     exchange_output = cast(dict[str, object], output[exchange])
                     symbol_key = symbol.upper()
-                    result_key = (exchange, symbol, timeframe)
-                    if multi_timeframe:
-                        timeframe_bucket = cast(dict[str, object], exchange_output.setdefault(timeframe, {}))
+                    result_key = (exchange, market, symbol, timeframe)
+                    if multi_market:
+                        market_bucket = cast(dict[str, object], exchange_output.setdefault(market, {}))
                     else:
-                        timeframe_bucket = exchange_output
+                        market_bucket = exchange_output
+                    if multi_timeframe:
+                        timeframe_bucket = cast(dict[str, object], market_bucket.setdefault(timeframe, {}))
+                    else:
+                        timeframe_bucket = market_bucket
                     if result_key in task_errors:
                         timeframe_bucket[symbol_key] = {"error": task_errors[result_key]}
                         continue
                     candles = task_results.get(result_key, [])
                     timeframe_bucket[symbol_key] = [_serialize_candle(item) for item in candles]
-                    exchange_candles = candles_for_plots.setdefault(exchange, {})
-                    plot_key = f"{symbol_key}__{timeframe}" if multi_timeframe else symbol_key
+                    by_market = candles_for_storage.setdefault(market, {})
+                    exchange_candles = by_market.setdefault(exchange, {})
+                    if multi_market and multi_timeframe:
+                        plot_key = f"{market}_{symbol_key}__{timeframe}"
+                    elif multi_market:
+                        plot_key = f"{market}_{symbol_key}"
+                    elif multi_timeframe:
+                        plot_key = f"{symbol_key}__{timeframe}"
+                    else:
+                        plot_key = symbol_key
                     exchange_candles[plot_key] = candles
 
                 if args.save_parquet_lake:
                     try:
-                        parquet_files = save_spot_candles_parquet_lake(
-                            candles_by_exchange=candles_for_plots,
-                            market=market,
-                            lake_root=args.lake_root,
-                        )
+                        parquet_files: list[str] = []
+                        for market_key, candles_by_exchange in candles_for_storage.items():
+                            parquet_files.extend(
+                                save_spot_candles_parquet_lake(
+                                    candles_by_exchange=candles_by_exchange,
+                                    market=market_key,
+                                    lake_root=args.lake_root,
+                                )
+                            )
                         output["_parquet_files"] = parquet_files
                     except Exception as exc:  # noqa: BLE001
                         output["_parquet_error"] = str(exc)
@@ -533,10 +549,17 @@ def main() -> None:
 
                 if args.plot:
                     plot_source: dict[str, dict[str, list[SpotCandle]]] = {}
-                    for exchange, symbol, timeframe in tasks:
+                    for exchange, market, symbol, timeframe in tasks:
                         symbol_key = symbol.upper()
-                        plot_key = f"{symbol_key}__{timeframe}" if multi_timeframe else symbol_key
-                        result_key = (exchange, symbol, timeframe)
+                        if multi_market and multi_timeframe:
+                            plot_key = f"{market}_{symbol_key}__{timeframe}"
+                        elif multi_market:
+                            plot_key = f"{market}_{symbol_key}"
+                        elif multi_timeframe:
+                            plot_key = f"{symbol_key}__{timeframe}"
+                        else:
+                            plot_key = symbol_key
+                        result_key = (exchange, market, symbol, timeframe)
                         fetched = task_results.get(result_key, [])
                         merged_by_open_time = {item.open_time: item for item in fetched}
                         try:
@@ -563,9 +586,7 @@ def main() -> None:
                             )
 
                         exchange_plots = plot_source.setdefault(exchange, {})
-                        exchange_plots[plot_key] = [
-                            merged_by_open_time[key] for key in sorted(merged_by_open_time)
-                        ]
+                        exchange_plots[plot_key] = [merged_by_open_time[key] for key in sorted(merged_by_open_time)]
 
                     try:
                         saved_paths = save_candle_plots(
@@ -580,7 +601,7 @@ def main() -> None:
 
                 if not args.no_json_output:
                     print(json.dumps(output, indent=2))
-                logger.info("Command complete: fetcher")
+                logger.info("Command complete: loader")
         except SingleInstanceError as exc:
             logger.warning("Single-instance lock active")
             raise SystemExit(str(exc)) from exc
@@ -630,18 +651,18 @@ def main() -> None:
         else:
             dataframe.to_csv(output_path, index=False)
 
-        summary = {
+        export_summary: dict[str, object] = {
             "output": str(output_path.resolve()),
             "format": args.format,
             "rows": int(getattr(dataframe, "shape", (0, 0))[0]),
             "columns": list(getattr(dataframe, "columns", [])),
         }
         if not args.no_json_output:
-            print(json.dumps(summary, indent=2))
+            print(json.dumps(export_summary, indent=2))
         logger.info(
             "Command complete: export-combined-df output=%s rows=%s",
-            summary["output"],
-            summary["rows"],
+            export_summary["output"],
+            export_summary["rows"],
         )
 
 

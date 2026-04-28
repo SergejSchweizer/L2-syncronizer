@@ -47,6 +47,8 @@ Rules:
 - Avoid large monolithic scripts
 - Separate experimental notebooks from production code
 - Move reusable notebook logic into Python modules
+- Code must be structured according to optimal software design patterns for the use case (for example clear layering, separation of concerns, dependency inversion where appropriate, and composable modules).
+- Design choices must prioritize long-term maintainability over short-term convenience.
 
 ---
 
@@ -112,6 +114,40 @@ Always ignore and keep untracked:
 
 If any of these paths are accidentally tracked, agents must remove them from git tracking using cached removal (keep local files), then confirm `.gitignore` contains the proper exclusions.
 
+## Commit Message Rules (MANDATORY)
+
+All commits must use Conventional Commits format.
+
+Required structure:
+
+```text
+type(scope): short summary
+```
+
+Allowed `type` values:
+
+- `feat`
+- `fix`
+- `refactor`
+- `test`
+- `docs`
+- `chore`
+- `ci`
+- `build`
+- `perf`
+
+Rules:
+
+- Commit messages that do not follow Conventional Commits are not allowed.
+- Summary must be concise and written in imperative mood.
+- Use `scope` for module/domain when possible (for example `ingestion`, `api`, `tests`, `docs`).
+
+Examples:
+
+- `feat(ingestion): add bybit spot and perp kline adapter`
+- `fix(api): run fetch tasks sequentially for all-history stability`
+- `test(spot): cover bybit market routing`
+
 ---
 
 # Security Rules
@@ -121,6 +157,8 @@ If any of these paths are accidentally tracked, agents must remove them from git
 - Never expose API keys
 - Use environment variables
 - Use `.env.example`
+- Sensitive information (passwords, tokens, private keys, connection strings) must be stored only in local config files or environment files that are excluded from git tracking.
+- Local config files that may contain sensitive values must always be listed in `.gitignore` and must never be committed.
 
 ---
 
@@ -140,6 +178,7 @@ It must always include:
 - deployment instructions
 - known limitations
 - future improvements
+- architecture and storage tradeoff decisions with rationale (for example why Parquet, why TimescaleDB, and alternatives considered)
 
 Use nested sections.
 
@@ -480,4 +519,3 @@ The repository should function simultaneously as:
 - software product
 - research artifact
 - portfolio asset
-

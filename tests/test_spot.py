@@ -2,19 +2,19 @@
 
 from __future__ import annotations
 
-from datetime import timezone
+from datetime import UTC
 
 import pytest
 
 from ingestion.exchanges import deribit
 from ingestion.spot import (
-    fetch_binance_spot_candles,
+    Exchange,
+    Market,
     fetch_candles,
     fetch_candles_all_history,
     normalize_timeframe,
     parse_kline,
 )
-
 
 
 def test_parse_binance_kline_maps_fields() -> None:
@@ -37,19 +37,18 @@ def test_parse_binance_kline_maps_fields() -> None:
 
     assert candle.symbol == "BTCUSDT"
     assert candle.interval == "1h"
-    assert candle.open_time.tzinfo == timezone.utc
+    assert candle.open_time.tzinfo == UTC
     assert candle.close_price == pytest.approx(64100.0)
     assert candle.volume == pytest.approx(120.5)
     assert candle.trade_count == 2300
 
 
-
-def test_fetch_binance_spot_candles_rejects_invalid_limit() -> None:
+def test_fetch_binance_spot_rejects_invalid_limit() -> None:
     with pytest.raises(ValueError):
-        fetch_binance_spot_candles("BTCUSDT", limit=0)
+        fetch_candles(exchange="binance", symbol="BTCUSDT", market="spot", limit=0)
 
 
-def test_fetch_binance_spot_candles_paginates_and_orders(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_fetch_binance_spot_paginates_and_orders(monkeypatch: pytest.MonkeyPatch) -> None:
     from ingestion.exchanges import binance
 
     calls: list[dict[str, object]] = []
@@ -77,7 +76,7 @@ def test_fetch_binance_spot_candles_paginates_and_orders(monkeypatch: pytest.Mon
         return older_page
 
     monkeypatch.setattr(binance, "get_json", fake_get_json)
-    candles = fetch_binance_spot_candles("BTCUSDT", interval="1m", limit=4)
+    candles = fetch_candles(exchange="binance", symbol="BTCUSDT", market="spot", interval="1m", limit=4)
 
     assert len(candles) == 4
     assert [item.open_time.timestamp() for item in candles] == [1.0, 2.0, 3.0, 4.0]
@@ -206,7 +205,7 @@ def test_fetch_binance_spot_routes_to_spot_endpoint(monkeypatch: pytest.MonkeyPa
 )
 def test_fetch_deribit_routes_spot_and_perp_symbols(
     monkeypatch: pytest.MonkeyPatch,
-    market: str,
+    market: Market,
     symbol: str,
     expected_instrument: str,
     expected_symbol: str,
@@ -277,8 +276,8 @@ def test_fetch_all_history_routes_to_exchange_all_fetch(monkeypatch: pytest.Monk
 )
 def test_fetch_all_history_supports_spot_and_perp_on_both_exchanges(
     monkeypatch: pytest.MonkeyPatch,
-    exchange: str,
-    market: str,
+    exchange: Exchange,
+    market: Market,
     input_symbol: str,
     expected_fetch_symbol: str,
     expected_candle_symbol: str,
@@ -290,21 +289,21 @@ def test_fetch_all_history_supports_spot_and_perp_on_both_exchanges(
 
         captured: list[dict[str, object]] = []
 
-        def fake_fetch_klines_all(symbol: str, interval: str, market: str = "spot") -> list[list[object]]:
+        def fake_fetch_klines_all_binance(symbol: str, interval: str, market: str = "spot") -> list[list[object]]:
             captured.append({"symbol": symbol, "interval": interval, "market": market})
             return [row]
 
-        monkeypatch.setattr(binance_exchange, "fetch_klines_all", fake_fetch_klines_all)
+        monkeypatch.setattr(binance_exchange, "fetch_klines_all", fake_fetch_klines_all_binance)
     else:
         from ingestion.exchanges import deribit as deribit_exchange
 
         captured = []
 
-        def fake_fetch_klines_all(symbol: str, market: str, interval: str) -> list[list[object]]:
+        def fake_fetch_klines_all_deribit(symbol: str, market: str, interval: str) -> list[list[object]]:
             captured.append({"symbol": symbol, "interval": interval, "market": market})
             return [row]
 
-        monkeypatch.setattr(deribit_exchange, "fetch_klines_all", fake_fetch_klines_all)
+        monkeypatch.setattr(deribit_exchange, "fetch_klines_all", fake_fetch_klines_all_deribit)
 
     candles = fetch_candles_all_history(
         exchange=exchange,

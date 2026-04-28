@@ -29,19 +29,16 @@ BINANCE_SPOT_KLINES_URL = "https://api.binance.com/api/v3/klines"
 BINANCE_PERP_KLINES_URL = "https://fapi.binance.com/fapi/v1/klines"
 
 
-
 def list_supported_intervals() -> tuple[str, ...]:
     """Return Binance-supported kline intervals."""
 
     return BINANCE_SUPPORTED_INTERVALS
 
 
-
 def max_limit() -> int:
     """Return max kline points Binance allows per single request."""
 
     return BINANCE_MAX_KLINES_PER_REQUEST
-
 
 
 def interval_to_milliseconds(interval: str) -> int:
@@ -60,7 +57,6 @@ def interval_to_milliseconds(interval: str) -> int:
     if interval.endswith("M"):
         raise ValueError("Monthly interval is not supported for gap-fill mode. Use --limit with 1M.")
     raise ValueError(f"Unsupported interval '{interval}'")
-
 
 
 def normalize_timeframe(value: str) -> str:
@@ -88,9 +84,9 @@ def normalize_timeframe(value: str) -> str:
         return candidate
 
     raise ValueError(
-        f"Unsupported timeframe '{value}' for binance. "
-        f"Supported values: {', '.join(BINANCE_SUPPORTED_INTERVALS)}"
+        f"Unsupported timeframe '{value}' for binance. Supported values: {', '.join(BINANCE_SUPPORTED_INTERVALS)}"
     )
+
 
 def normalize_symbol(symbol: str, market: str) -> str:
     """Normalize user symbols for Binance spot/perpetual markets."""
@@ -139,7 +135,6 @@ def fetch_klines(symbol: str, interval: str, limit: int, market: str = "spot") -
         end_time_ms = earliest_open_time_ms - 1
 
     return [row for page in reversed(pages) for row in page]
-
 
 
 def fetch_klines_all(symbol: str, interval: str, market: str = "spot") -> list[list[object]]:
@@ -223,12 +218,10 @@ def fetch_klines_range(
     return [dedup[key] for key in sorted(dedup)]
 
 
-
-def _extract_open_time_ms(row: list[object]) -> int:
+def _extract_open_time_ms(row: list[Any]) -> int:
     """Return kline open time in milliseconds."""
 
     return int(row[0])
-
 
 
 def _fetch_klines_page(

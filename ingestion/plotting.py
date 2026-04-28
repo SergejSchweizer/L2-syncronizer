@@ -11,7 +11,6 @@ from ingestion.spot import SpotCandle
 PriceField = Literal["spot", "close", "open", "high", "low"]
 
 
-
 def price_value(candle: SpotCandle, price_field: PriceField) -> float:
     """Select a price value from a candle based on requested field."""
 
@@ -22,7 +21,6 @@ def price_value(candle: SpotCandle, price_field: PriceField) -> float:
     if price_field == "high":
         return candle.high_price
     return candle.low_price
-
 
 
 def build_plot_filename(
@@ -37,7 +35,6 @@ def build_plot_filename(
         return re.sub(r"[^A-Za-z0-9_.-]+", "_", value)
 
     return f"{safe(exchange)}_{safe(symbol)}_{safe(interval)}_{safe(price_field)}.png"
-
 
 
 def save_candle_plots(
@@ -111,9 +108,9 @@ def save_candle_plots(
                 pad=10,
             )
 
-            time_points = mdates.date2num(times)
+            time_points = mdates.date2num(times)  # type: ignore[no-untyped-call]
             if len(time_points) > 1:
-                deltas = [current - previous for previous, current in zip(time_points, time_points[1:])]
+                deltas = [current - previous for previous, current in zip(time_points, time_points[1:], strict=False)]
                 median_delta = sorted(deltas)[len(deltas) // 2]
                 bar_width = max(median_delta * 0.58, 0.00005)
             else:
@@ -122,7 +119,7 @@ def save_candle_plots(
             volume_colors = ["#2f9e44"]
             volume_colors.extend(
                 "#2f9e44" if current >= previous else "#c92a2a"
-                for previous, current in zip(prices, prices[1:])
+                for previous, current in zip(prices, prices[1:], strict=False)
             )
             volume_axis.bar(
                 times,
@@ -136,7 +133,7 @@ def save_candle_plots(
             volume_axis.set_ylabel("volume", color="#334155")
             volume_axis.yaxis.set_major_formatter(mticker.StrMethodFormatter("{x:,.0f}"))
             volume_axis.set_xlabel("time (UTC)", color="#334155")
-            volume_axis.xaxis.set_major_formatter(mdates.DateFormatter("%m.%Y"))
+            volume_axis.xaxis.set_major_formatter(mdates.DateFormatter("%m.%Y"))  # type: ignore[no-untyped-call]
             volume_axis.legend(
                 handles=[
                     mpatches.Patch(color="#2f9e44", label="Price up vs previous candle"),

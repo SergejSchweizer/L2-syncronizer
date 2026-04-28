@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timezone
-from typing import Literal
+from datetime import UTC, datetime
+from typing import Any, Literal
 
 from ingestion.exchanges import binance, bybit, deribit
 
@@ -14,7 +14,29 @@ Market = Literal["spot", "perp"]
 
 @dataclass(frozen=True)
 class SpotCandle:
-    """OHLCV candle for an instrument."""
+    """OHLCV candle for an instrument.
+
+    Example:
+        ```python
+        from datetime import UTC, datetime
+        from ingestion.spot import SpotCandle
+
+        candle = SpotCandle(
+            exchange="binance",
+            symbol="BTCUSDT",
+            interval="1m",
+            open_time=datetime(2026, 1, 1, 0, 0, tzinfo=UTC),
+            close_time=datetime(2026, 1, 1, 0, 0, 59, 999000, tzinfo=UTC),
+            open_price=100.0,
+            high_price=101.0,
+            low_price=99.0,
+            close_price=100.5,
+            volume=12.0,
+            quote_volume=1200.0,
+            trade_count=34,
+        )
+        ```
+    """
 
     exchange: str
     symbol: str
@@ -30,15 +52,13 @@ class SpotCandle:
     trade_count: int
 
 
-
 def _ms_to_utc(ts_ms: int) -> datetime:
     """Convert epoch milliseconds to timezone-aware UTC datetime."""
 
-    return datetime.fromtimestamp(ts_ms / 1000, tz=timezone.utc)
+    return datetime.fromtimestamp(ts_ms / 1000, tz=UTC)
 
 
-
-def parse_kline(exchange: Exchange, symbol: str, interval: str, row: list[object]) -> SpotCandle:
+def parse_kline(exchange: Exchange, symbol: str, interval: str, row: list[Any]) -> SpotCandle:
     """Parse a common kline row into a typed candle object."""
 
     return SpotCandle(
@@ -57,7 +77,6 @@ def parse_kline(exchange: Exchange, symbol: str, interval: str, row: list[object
     )
 
 
-
 def list_supported_intervals(exchange: Exchange) -> tuple[str, ...]:
     """List supported intervals for the requested exchange."""
 
@@ -68,7 +87,6 @@ def list_supported_intervals(exchange: Exchange) -> tuple[str, ...]:
     if exchange == "bybit":
         return bybit.list_supported_intervals()
     raise ValueError(f"Unsupported exchange '{exchange}'")
-
 
 
 def normalize_timeframe(exchange: Exchange, value: str) -> str:
@@ -83,7 +101,6 @@ def normalize_timeframe(exchange: Exchange, value: str) -> str:
     raise ValueError(f"Unsupported exchange '{exchange}'")
 
 
-
 def max_candles_per_request(exchange: Exchange) -> int:
     """Return max single-request candle count for exchange."""
 
@@ -94,7 +111,6 @@ def max_candles_per_request(exchange: Exchange) -> int:
     if exchange == "bybit":
         return bybit.max_limit()
     raise ValueError(f"Unsupported exchange '{exchange}'")
-
 
 
 def interval_to_milliseconds(exchange: Exchange, interval: str) -> int:
@@ -109,7 +125,6 @@ def interval_to_milliseconds(exchange: Exchange, interval: str) -> int:
     raise ValueError(f"Unsupported exchange '{exchange}'")
 
 
-
 def normalize_storage_symbol(exchange: Exchange, symbol: str, market: Market) -> str:
     """Normalize symbol to storage form for selected exchange/market."""
 
@@ -120,7 +135,6 @@ def normalize_storage_symbol(exchange: Exchange, symbol: str, market: Market) ->
     if exchange == "bybit":
         return bybit.normalize_symbol(symbol=symbol, market=market)
     raise ValueError(f"Unsupported exchange '{exchange}'")
-
 
 
 def fetch_candles(
@@ -160,10 +174,8 @@ def fetch_candles(
         raise ValueError(f"Unsupported exchange '{exchange}'")
 
     return [
-        parse_kline(exchange=exchange, symbol=normalized_symbol, interval=normalized_interval, row=row)
-        for row in rows
+        parse_kline(exchange=exchange, symbol=normalized_symbol, interval=normalized_interval, row=row) for row in rows
     ]
-
 
 
 def fetch_candles_all_history(
@@ -199,8 +211,7 @@ def fetch_candles_all_history(
         raise ValueError(f"Unsupported exchange '{exchange}'")
 
     return [
-        parse_kline(exchange=exchange, symbol=normalized_symbol, interval=normalized_interval, row=row)
-        for row in rows
+        parse_kline(exchange=exchange, symbol=normalized_symbol, interval=normalized_interval, row=row) for row in rows
     ]
 
 
@@ -245,20 +256,5 @@ def fetch_candles_range(
         raise ValueError(f"Unsupported exchange '{exchange}'")
 
     return [
-        parse_kline(exchange=exchange, symbol=normalized_symbol, interval=normalized_interval, row=row)
-        for row in rows
+        parse_kline(exchange=exchange, symbol=normalized_symbol, interval=normalized_interval, row=row) for row in rows
     ]
-
-
-
-def fetch_binance_spot_candles(symbol: str, interval: str = "1h", limit: int = 100) -> list[SpotCandle]:
-    """Compatibility wrapper for existing Binance-only callers."""
-
-    return fetch_candles(exchange="binance", symbol=symbol, interval=interval, limit=limit, market="spot")
-
-
-
-def list_binance_supported_intervals() -> tuple[str, ...]:
-    """Compatibility wrapper for existing Binance-only callers."""
-
-    return list_supported_intervals(exchange="binance")

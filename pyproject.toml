@@ -3,7 +3,7 @@ requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "crypto-l2-fetcher"
+name = "crypto-l2-loader"
 version = "0.1.0"
 description = "Framework for crypto L2 and market data ingestion"
 readme = "README.md"
@@ -13,6 +13,7 @@ dependencies = [
   "ruff>=0.6.0",
   "mypy>=1.10.0",
   "pandas>=2.2.0",
+  "pandas-stubs>=2.2.0.240218",
   "matplotlib>=3.8.0",
   "pyarrow>=16.0.0",
   "psycopg[binary]>=3.2.0",
@@ -35,7 +36,7 @@ pythonpath = ["."]
 addopts = "-q"
 
 [tool.ruff]
-line-length = 100
+line-length = 120
 target-version = "py311"
 
 [tool.ruff.lint]

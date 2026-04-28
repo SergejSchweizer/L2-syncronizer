@@ -61,8 +61,7 @@ def normalize_timeframe(value: str) -> str:
         return candidate
 
     raise ValueError(
-        f"Unsupported timeframe '{value}' for bybit. "
-        f"Supported values: {', '.join(BYBIT_SUPPORTED_INTERVALS)}"
+        f"Unsupported timeframe '{value}' for bybit. Supported values: {', '.join(BYBIT_SUPPORTED_INTERVALS)}"
     )
 
 
@@ -223,7 +222,7 @@ def fetch_klines_range(
     return [dedup[key] for key in sorted(dedup)]
 
 
-def _extract_open_time_ms(row: list[object]) -> int:
+def _extract_open_time_ms(row: list[Any]) -> int:
     """Return kline open time in milliseconds."""
 
     return int(row[0])

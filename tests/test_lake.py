@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 from ingestion.lake import (
@@ -17,14 +17,13 @@ from ingestion.lake import (
 from ingestion.spot import SpotCandle
 
 
-
 def _sample_candle() -> SpotCandle:
     return SpotCandle(
         exchange="binance",
         symbol="BTCUSDT",
         interval="1m",
-        open_time=datetime(2026, 4, 27, 10, 0, tzinfo=timezone.utc),
-        close_time=datetime(2026, 4, 27, 10, 0, 59, 999000, tzinfo=timezone.utc),
+        open_time=datetime(2026, 4, 27, 10, 0, tzinfo=UTC),
+        close_time=datetime(2026, 4, 27, 10, 0, 59, 999000, tzinfo=UTC),
         open_price=100.0,
         high_price=110.0,
         low_price=90.0,
@@ -33,7 +32,6 @@ def _sample_candle() -> SpotCandle:
         quote_volume=1500.0,
         trade_count=42,
     )
-
 
 
 def test_partition_key_and_path() -> None:
@@ -47,10 +45,9 @@ def test_partition_key_and_path() -> None:
     )
 
 
-
 def test_candle_record_contains_core_fields() -> None:
     candle = _sample_candle()
-    ingested_at = datetime(2026, 4, 27, 12, 0, tzinfo=timezone.utc)
+    ingested_at = datetime(2026, 4, 27, 12, 0, tzinfo=UTC)
     record = candle_record(candle=candle, market="spot", run_id="run-1", ingested_at=ingested_at)
 
     assert record["dataset_type"] == "ohlcv"
@@ -61,8 +58,8 @@ def test_candle_record_contains_core_fields() -> None:
 
 
 def test_merge_and_deduplicate_rows_keeps_latest_record() -> None:
-    first_time = datetime(2026, 4, 27, 10, 0, tzinfo=timezone.utc)
-    second_time = datetime(2026, 4, 27, 11, 0, tzinfo=timezone.utc)
+    first_time = datetime(2026, 4, 27, 10, 0, tzinfo=UTC)
+    second_time = datetime(2026, 4, 27, 11, 0, tzinfo=UTC)
     base = {
         "exchange": "binance",
         "instrument_type": "spot",
@@ -85,8 +82,8 @@ def test_save_spot_candles_parquet_lake_rewrites_single_partition_file(tmp_path:
         exchange="binance",
         symbol="BTCUSDT",
         interval="1m",
-        open_time=datetime(2026, 4, 27, 10, 0, tzinfo=timezone.utc),
-        close_time=datetime(2026, 4, 27, 10, 0, 59, 999000, tzinfo=timezone.utc),
+        open_time=datetime(2026, 4, 27, 10, 0, tzinfo=UTC),
+        close_time=datetime(2026, 4, 27, 10, 0, 59, 999000, tzinfo=UTC),
         open_price=100.0,
         high_price=101.0,
         low_price=99.0,
@@ -99,8 +96,8 @@ def test_save_spot_candles_parquet_lake_rewrites_single_partition_file(tmp_path:
         exchange="binance",
         symbol="BTCUSDT",
         interval="1m",
-        open_time=datetime(2026, 4, 27, 10, 1, tzinfo=timezone.utc),
-        close_time=datetime(2026, 4, 27, 10, 1, 59, 999000, tzinfo=timezone.utc),
+        open_time=datetime(2026, 4, 27, 10, 1, tzinfo=UTC),
+        close_time=datetime(2026, 4, 27, 10, 1, 59, 999000, tzinfo=UTC),
         open_price=100.5,
         high_price=102.0,
         low_price=100.0,
@@ -126,8 +123,8 @@ def test_open_times_in_lake_returns_sorted_unique(tmp_path: Path) -> None:
         exchange="binance",
         symbol="BTCUSDT",
         interval="1m",
-        open_time=datetime(2026, 4, 27, 10, 0, tzinfo=timezone.utc),
-        close_time=datetime(2026, 4, 27, 10, 0, 59, 999000, tzinfo=timezone.utc),
+        open_time=datetime(2026, 4, 27, 10, 0, tzinfo=UTC),
+        close_time=datetime(2026, 4, 27, 10, 0, 59, 999000, tzinfo=UTC),
         open_price=100.0,
         high_price=101.0,
         low_price=99.0,
@@ -140,8 +137,8 @@ def test_open_times_in_lake_returns_sorted_unique(tmp_path: Path) -> None:
         exchange="binance",
         symbol="BTCUSDT",
         interval="1m",
-        open_time=datetime(2026, 4, 27, 10, 1, tzinfo=timezone.utc),
-        close_time=datetime(2026, 4, 27, 10, 1, 59, 999000, tzinfo=timezone.utc),
+        open_time=datetime(2026, 4, 27, 10, 1, tzinfo=UTC),
+        close_time=datetime(2026, 4, 27, 10, 1, 59, 999000, tzinfo=UTC),
         open_price=101.0,
         high_price=102.0,
         low_price=100.0,
@@ -168,8 +165,8 @@ def test_load_spot_candles_from_lake_reads_full_partition_history(tmp_path: Path
         exchange="binance",
         symbol="BTCUSDT",
         interval="1m",
-        open_time=datetime(2026, 4, 27, 10, 0, tzinfo=timezone.utc),
-        close_time=datetime(2026, 4, 27, 10, 0, 59, 999000, tzinfo=timezone.utc),
+        open_time=datetime(2026, 4, 27, 10, 0, tzinfo=UTC),
+        close_time=datetime(2026, 4, 27, 10, 0, 59, 999000, tzinfo=UTC),
         open_price=100.0,
         high_price=101.0,
         low_price=99.0,
@@ -182,8 +179,8 @@ def test_load_spot_candles_from_lake_reads_full_partition_history(tmp_path: Path
         exchange="binance",
         symbol="BTCUSDT",
         interval="1m",
-        open_time=datetime(2026, 5, 1, 0, 0, tzinfo=timezone.utc),
-        close_time=datetime(2026, 5, 1, 0, 0, 59, 999000, tzinfo=timezone.utc),
+        open_time=datetime(2026, 5, 1, 0, 0, tzinfo=UTC),
+        close_time=datetime(2026, 5, 1, 0, 0, 59, 999000, tzinfo=UTC),
         open_price=110.0,
         high_price=112.0,
         low_price=109.0,

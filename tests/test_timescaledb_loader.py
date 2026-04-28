@@ -3,14 +3,16 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 import pytest
+
 from ingestion.timescaledb_loader import (
     _ensure_tables,
     _upsert_rows,
+    ingest_parquet_to_timescaledb,
     list_parquet_files,
     load_timescale_config_from_env,
     parquet_file_signature,
@@ -172,7 +174,7 @@ def test_parquet_file_signature_changes_with_content(tmp_path: Path) -> None:
 
 def test_ensure_tables_tolerates_hypertable_failure() -> None:
     class FakeCursor:
-        def __enter__(self) -> "FakeCursor":
+        def __enter__(self) -> FakeCursor:
             return self
 
         def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
@@ -194,7 +196,7 @@ def test_upsert_rows_serializes_datetime_in_extra() -> None:
         def __init__(self) -> None:
             self.params: list[tuple[Any, ...]] = []
 
-        def __enter__(self) -> "FakeCursor":
+        def __enter__(self) -> FakeCursor:
             return self
 
         def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
@@ -212,7 +214,7 @@ def test_upsert_rows_serializes_datetime_in_extra() -> None:
             return self.cursor_obj
 
     connection = FakeConnection()
-    now = datetime(2026, 4, 27, 12, 0, tzinfo=timezone.utc)
+    now = datetime(2026, 4, 27, 12, 0, tzinfo=UTC)
     row = {
         "schema_version": "v1",
         "dataset_type": "ohlcv",
@@ -243,3 +245,103 @@ def test_upsert_rows_serializes_datetime_in_extra() -> None:
     parsed_extra = json.loads(serialized_extra)
     assert parsed_extra["open_time"] == now.isoformat()
     assert parsed_extra["nested"]["close_time"] == now.isoformat()
+
+
+def test_ingest_parquet_to_timescaledb_processes_record_batches_and_commits(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    data_file = (
+        tmp_path
+        / "dataset_type=ohlcv"
+        / "exchange=binance"
+        / "instrument_type=spot"
+        / "symbol=BTCUSDT"
+        / "timeframe=1m"
+        / "date=2026-04"
+        / "data.parquet"
+    )
+    data_file.parent.mkdir(parents=True, exist_ok=True)
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    now = datetime(2026, 4, 27, 12, 0, tzinfo=UTC)
+    row_1 = {
+        "schema_version": "v1",
+        "dataset_type": "ohlcv",
+        "exchange": "binance",
+        "symbol": "BTCUSDT",
+        "instrument_type": "spot",
+        "event_time": now,
+        "ingested_at": now,
+        "run_id": "run-1",
+        "source_endpoint": "public_market_data",
+        "open_time": now,
+        "close_time": now,
+        "timeframe": "1m",
+        "open": 1.0,
+        "high": 2.0,
+        "low": 0.5,
+        "close": 1.5,
+        "volume": 10.0,
+        "quote_volume": 15.0,
+        "trade_count": 2,
+        "extra": {"row": 1},
+    }
+    row_2 = {**row_1, "open": 2.0, "extra": {"row": 2}}
+    pq.write_table(pa.Table.from_pylist([row_1, row_2]), data_file)  # type: ignore[no-untyped-call]
+
+    class FakeCursor:
+        def __enter__(self) -> FakeCursor:
+            return self
+
+        def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
+            del exc_type, exc, tb
+
+        def execute(self, query: str, params: tuple[Any, ...] | None = None) -> None:
+            del query, params
+
+        def executemany(self, query: str, params: list[tuple[Any, ...]]) -> None:
+            del query, params
+
+        def fetchall(self) -> list[tuple[str, int, int]]:
+            return []
+
+    class FakeConnection:
+        def __init__(self) -> None:
+            self.commit_calls = 0
+            self.cursor_obj = FakeCursor()
+
+        def __enter__(self) -> FakeConnection:
+            return self
+
+        def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
+            del exc_type, exc, tb
+
+        def cursor(self) -> FakeCursor:
+            return self.cursor_obj
+
+        def commit(self) -> None:
+            self.commit_calls += 1
+
+    fake_connection = FakeConnection()
+
+    class FakePsycopg:
+        @staticmethod
+        def connect(**kwargs: Any) -> FakeConnection:
+            del kwargs
+            return fake_connection
+
+    monkeypatch.setitem(__import__("sys").modules, "psycopg", FakePsycopg)
+
+    summary = ingest_parquet_to_timescaledb(
+        lake_root=str(tmp_path),
+        config=load_timescale_config_from_env(),
+        batch_size=1,
+        dataset_types=["ohlcv"],
+    )
+
+    assert summary["files_scanned"] == 1
+    assert summary["files_ingested"] == 1
+    assert summary["rows_upserted"] == 2
+    assert fake_connection.commit_calls >= 3

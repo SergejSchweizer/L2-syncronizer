@@ -15,7 +15,22 @@ FileSignature = tuple[int, int]
 
 @dataclass(frozen=True)
 class TimescaleConfig:
-    """Database connection settings for TimescaleDB."""
+    """Database connection settings for TimescaleDB.
+
+    Example:
+        ```python
+        from ingestion.timescaledb_loader import TimescaleConfig
+
+        config = TimescaleConfig(
+            host="127.0.0.1",
+            port=5432,
+            user="postgres",
+            password="postgres",
+            dbname="crypto",
+            sslmode="disable",
+        )
+        ```
+    """
 
     host: str
     port: int
@@ -100,8 +115,7 @@ def list_parquet_files(lake_root: str, dataset_types: list[DatasetType] | None =
         files.extend(
             sorted(
                 root.glob(
-                    "dataset_type="
-                    f"{dataset_type}/exchange=*/instrument_type=*/symbol=*/timeframe=*/date=*/data.parquet"
+                    f"dataset_type={dataset_type}/exchange=*/instrument_type=*/symbol=*/timeframe=*/date=*/data.parquet"
                 )
             )
         )
@@ -313,7 +327,11 @@ def ingest_parquet_to_timescaledb(
     batch_size: int = 1000,
     dataset_types: list[DatasetType] | None = None,
 ) -> dict[str, int]:
-    """Load parquet-lake files into TimescaleDB with state-based incremental updates."""
+    """Load parquet-lake files into TimescaleDB with state-based incremental updates.
+
+    Files are processed in record batches to keep memory bounded. Each upsert batch
+    is committed before moving to the next batch to reduce transaction blast radius.
+    """
 
     if batch_size <= 0:
         raise ValueError("batch_size must be positive")
@@ -354,9 +372,13 @@ def ingest_parquet_to_timescaledb(
                 summary["files_skipped"] += 1
                 continue
 
-            table = pq.ParquetFile(file_path).read()
-            rows = table.to_pylist()
-            summary["rows_upserted"] += _upsert_rows(connection=connection, rows=rows, batch_size=batch_size)
+            parquet_file = pq.ParquetFile(file_path)  # type: ignore[no-untyped-call]
+            for record_batch in parquet_file.iter_batches(batch_size=batch_size):  # type: ignore[no-untyped-call]
+                rows = record_batch.to_pylist()
+                if not rows:
+                    continue
+                summary["rows_upserted"] += _upsert_rows(connection=connection, rows=rows, batch_size=batch_size)
+                connection.commit()
             _save_ingestion_state(connection=connection, file_path=state_key, signature=signature)
             connection.commit()
             summary["files_ingested"] += 1

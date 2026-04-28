@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
-from typing import Any
+from datetime import UTC, datetime
+from typing import Any, cast
 
 from ingestion.http_client import get_json
 
@@ -24,19 +24,16 @@ DERIBIT_SUPPORTED_INTERVALS: tuple[str, ...] = (
 DERIBIT_MAX_POINTS_PER_REQUEST = 5000
 
 
-
 def list_supported_intervals() -> tuple[str, ...]:
     """Return Deribit-supported candle intervals."""
 
     return DERIBIT_SUPPORTED_INTERVALS
 
 
-
 def max_limit() -> int:
     """Return max chart points Deribit allows per request window."""
 
     return DERIBIT_MAX_POINTS_PER_REQUEST
-
 
 
 def normalize_timeframe(value: str) -> str:
@@ -64,10 +61,8 @@ def normalize_timeframe(value: str) -> str:
         return candidate
 
     raise ValueError(
-        f"Unsupported timeframe '{value}' for deribit. "
-        f"Supported values: {', '.join(DERIBIT_SUPPORTED_INTERVALS)}"
+        f"Unsupported timeframe '{value}' for deribit. Supported values: {', '.join(DERIBIT_SUPPORTED_INTERVALS)}"
     )
-
 
 
 def to_deribit_resolution(interval: str) -> str:
@@ -82,7 +77,6 @@ def to_deribit_resolution(interval: str) -> str:
     raise ValueError(f"Cannot map interval '{interval}' to Deribit resolution")
 
 
-
 def interval_to_milliseconds(interval: str) -> int:
     """Convert normalized interval into milliseconds."""
 
@@ -93,7 +87,6 @@ def interval_to_milliseconds(interval: str) -> int:
     if interval == "1d":
         return 86_400_000
     raise ValueError(f"Unsupported interval '{interval}'")
-
 
 
 def normalize_symbol(symbol: str, market: str) -> str:
@@ -107,9 +100,7 @@ def normalize_symbol(symbol: str, market: str) -> str:
             return "ETH-PERPETUAL"
         if upper.endswith("-PERPETUAL"):
             return upper
-        raise ValueError(
-            "Unsupported Deribit perp symbol. Use BTC-PERPETUAL/ETH-PERPETUAL or BTC/ETH aliases."
-        )
+        raise ValueError("Unsupported Deribit perp symbol. Use BTC-PERPETUAL/ETH-PERPETUAL or BTC/ETH aliases.")
 
     if market == "spot":
         if upper in {"BTC", "BTCUSDT", "BTCUSD", "BTC_USDC"}:
@@ -121,7 +112,6 @@ def normalize_symbol(symbol: str, market: str) -> str:
         raise ValueError("Unsupported Deribit spot symbol. Use BTC_USDC/ETH_USDC or BTC/ETH aliases.")
 
     raise ValueError("market must be either 'spot' or 'perp'")
-
 
 
 def fetch_klines(symbol: str, market: str, interval: str, limit: int) -> list[list[object]]:
@@ -166,7 +156,6 @@ def fetch_klines(symbol: str, market: str, interval: str, limit: int) -> list[li
     if len(rows) > limit:
         return rows[-limit:]
     return rows
-
 
 
 def fetch_klines_all(symbol: str, market: str, interval: str) -> list[list[object]]:
@@ -258,19 +247,16 @@ def fetch_klines_range(
     return [dedup[key] for key in sorted(dedup)]
 
 
-
 def _utc_now_ms() -> int:
     """Return current UTC time in milliseconds."""
 
-    return int(datetime.now(timezone.utc).timestamp() * 1000)
+    return int(datetime.now(UTC).timestamp() * 1000)
 
 
-
-def _extract_open_time_ms(row: list[object]) -> int:
+def _extract_open_time_ms(row: list[Any]) -> int:
     """Return candle open timestamp in milliseconds."""
 
     return int(row[0])
-
 
 
 def _fetch_chart_page(
@@ -309,10 +295,16 @@ def _fetch_chart_page(
 
     if not all(isinstance(values, list) for values in (ticks, opens, highs, lows, closes, volumes)):
         raise ValueError("Unexpected Deribit chart arrays")
+    tick_list = cast(list[Any], ticks)
+    open_list = cast(list[Any], opens)
+    high_list = cast(list[Any], highs)
+    low_list = cast(list[Any], lows)
+    close_list = cast(list[Any], closes)
+    volume_list = cast(list[Any], volumes)
 
     rows: list[list[object]] = []
     for ts, open_price, high_price, low_price, close_price, volume in zip(
-        ticks, opens, highs, lows, closes, volumes, strict=True
+        tick_list, open_list, high_list, low_list, close_list, volume_list, strict=True
     ):
         close_ts = int(ts) + candle_width_ms - 1
         rows.append(

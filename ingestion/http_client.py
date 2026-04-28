@@ -53,7 +53,6 @@ def _is_retryable_http_error(exc: HTTPError) -> bool:
     return exc.code == 429 or exc.code >= 500
 
 
-
 def get_json(
     url: str,
     params: dict[str, Any] | None = None,
@@ -81,11 +80,7 @@ def get_json(
     request_url = f"{url}?{query}" if query else url
     timeout_value = timeout_s if timeout_s is not None else _env_float("L2_HTTP_TIMEOUT_S", 15.0)
     retries = max_retries if max_retries is not None else _env_int("L2_HTTP_MAX_RETRIES", 3)
-    backoff = (
-        retry_backoff_s
-        if retry_backoff_s is not None
-        else _env_float("L2_HTTP_RETRY_BACKOFF_S", 1.0)
-    )
+    backoff = retry_backoff_s if retry_backoff_s is not None else _env_float("L2_HTTP_RETRY_BACKOFF_S", 1.0)
 
     for attempt in range(retries + 1):
         try:

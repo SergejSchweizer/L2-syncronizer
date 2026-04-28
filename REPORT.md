@@ -1,71 +1,144 @@
-# Multi-Exchange Candle Ingestion Baseline for BTC/ETH (Binance + Deribit)
+# Multi-Exchange OHLCV Ingestion Baseline for Crypto Research Pipelines
 
 ## Abstract
-This report documents the first implementation stage of a modular crypto data ingestion framework designed for research and production workflows. The immediate objective is to establish a reproducible baseline pipeline to fetch BTC/ETH market candles, including prices and traded volume, through public REST endpoints across multiple exchanges. We implement typed exchange adapters for Binance and Deribit and expose the workflow through a CLI command that supports configurable exchange, market type, symbols, interval, and request depth. The current dataset sources are Binance kline data and Deribit tradingview chart data queried on demand; each run returns recent OHLCV observations for specified instruments. Findings at this stage are engineering-focused: the pipeline successfully normalizes heterogeneous exchange payloads into deterministic records, validates timeframe constraints per exchange, supports paginated downloads for long lookbacks, provides full gap-fill synchronization (internal missing intervals and latest-tail backfill) from parquet state when explicit limits are omitted, can generate local price/volume plots for quick run-level verification, can persist downloaded candles to partitioned parquet lake storage for downstream ingestion, includes a reproducible Docker Compose scaffold for TimescaleDB bootstrapping, and now includes a dedicated parquet-to-TimescaleDB loader with incremental file-state tracking for idempotent upserts. The contribution of this stage is a maintainable ingestion foundation that can be extended to L2 order books, funding rates, and database-backed full/backfill synchronization modes in later iterations.
+This report presents a production-oriented baseline for multi-exchange cryptocurrency candle ingestion designed to support downstream quantitative research. The problem addressed is the lack of reproducible, maintainable ingestion layers in early-stage quant projects, where exchange-specific scripts and schema drift frequently undermine empirical validity. We implement a typed, modular ingestion pipeline with adapter abstractions for Binance, Deribit, and Bybit, a command-line interface for deterministic execution (including multi-market runs such as `--market spot perp`), partitioned parquet-lake storage, and incremental parquet-to-TimescaleDB ingestion. Data are sourced from public exchange REST endpoints and normalized into a canonical OHLCV schema with metadata fields for run traceability. The main finding is engineering-focused: the system provides deterministic normalization across heterogeneous API payloads, supports backward pagination and gap-fill synchronization, and preserves idempotent persistence via natural-key upserts. The contribution is a maintainable ingestion foundation suitable for subsequent market microstructure, regime, and forecasting studies, with explicit reproducibility controls (strict typing, tests, linting, and stable execution commands).
 
 ## Introduction
-Crypto market research systems require reliable and repeatable ingestion layers before advanced modeling can be trusted.
+Reliable market-data ingestion is a prerequisite for valid quantitative inference in crypto research.
 
-Many prototype systems fail because they tightly couple data pulls, transformation logic, and ad hoc scripts.
+Many practical pipelines fail due to exchange-specific one-off scripts, inconsistent timestamp handling, and weak reproducibility controls.
 
-We propose a modular ingestion baseline with strict typing, explicit interfaces, and command-line reproducibility.
+This project proposes a modular ingestion architecture with typed interfaces, explicit normalization, and reproducible command-line workflows.
 
-This stage contributes: (1) a production-oriented spot ingestion module, (2) a reusable CLI workflow, and (3) test coverage for parsing and input validation.
+The contributions of this stage are: (1) cross-exchange OHLCV normalization, (2) parquet-lake and TimescaleDB persistence paths, and (3) tested operational workflows for repeatable data acquisition.
 
 ## Literature Review
-Initial stage. Full quantitative literature synthesis will be added once modeling and evaluation components are implemented.
+Volatility clustering and regime dependence motivate robust historical market-data pipelines. ARCH/GARCH foundations establish heteroskedastic behavior in financial time series, requiring high-integrity timestamped observations (Engle, 1982; Bollerslev, 1986). Regime-switching frameworks further highlight sensitivity to data quality and temporal consistency (Hamilton, 1989). Later work on high-frequency econometrics and realized-volatility estimation reinforces the need for reliable, granular data ingestion and synchronization processes (Andersen et al., 2001; Barndorff-Nielsen and Shephard, 2002).
+
+Within crypto-specific empirical work, market microstructure studies and liquidity fragmentation analyses depend on exchange-consistent symbol and timeframe normalization. This baseline does not yet estimate econometric models, but it is intentionally built to satisfy upstream data-quality assumptions for such methods.
 
 ## Dataset
-- Source: Binance public REST API (`/api/v3/klines`) and Deribit public REST API (`/api/v2/public/get_tradingview_chart_data`).
-- Sample period: rolling recent candles requested at runtime.
-- Number of observations: user-defined via `--limit`.
-- Variables: open, high, low, close, base volume, quote volume, trade count.
-- Cleaning methodology: typed parsing and schema normalization.
-- Train/test split: not applicable in baseline ingestion-only stage.
+- Source: Binance `/api/v3/klines`, Binance Futures `/fapi/v1/klines`, Deribit `/api/v2/public/get_tradingview_chart_data`, Bybit `/v5/market/kline`.
+- Sample period: user-configurable rolling windows, all-history mode, or gap-fill mode.
+- Number of observations: runtime-dependent (`--limit`, `--all-history`, and symbol/timeframe scope).
+- Variables: `open_time`, `close_time`, `open`, `high`, `low`, `close`, `volume`, `quote_volume`, `trade_count` plus provenance metadata.
+- Cleaning methodology: exchange adapter normalization, timeframe validation, symbol normalization, UTC conversion, partition-level deduplication by natural key.
+- Train/test split: not applicable at ingestion-only stage.
 
 ## Methodology
-- Retrieve raw candle arrays from exchange-specific public endpoints.
-- Map ordered fields into strongly typed `SpotCandle` records.
-- Convert timestamps from epoch milliseconds to UTC datetime.
-- Enforce request constraints (`limit > 0`) and paginate where exchange limits apply.
+### System Design
+```text
+CLI -> Adapter Layer -> HTTP Client -> Exchange REST APIs
+    -> Normalized SpotCandle -> Parquet Lake -> TimescaleDB Upsert
+```
+
+### Core Mapping
+For each candle index \(t\):
+
+\[
+x_t = \{e, s, \Delta, \tau_t^{open}, \tau_t^{close}, o_t, h_t, l_t, c_t, v_t, qv_t, n_t\}
+\]
+
+where \(e\) is exchange, \(s\) symbol, \(\Delta\) timeframe, and \(n_t\) trade count.
+
+### Persistence Objective
+Rows are persisted with natural key:
+
+\[
+K = (exchange, instrument\_type, symbol, timeframe, open\_time)
+\]
+
+Upsert policy enforces idempotency:
+
+\[
+\text{row}_{new}(K) \leftarrow \text{row}_{incoming}(K)
+\]
+
+### Optimization Logic
+- Bounded HTTP retries with exponential backoff for transient failures.
+- Pagination for exchange request limits.
+- Gap-fill computes missing intervals from stored open-time sets.
+- Fetch execution is sequential across exchange/market/symbol/timeframe tasks.
+- Parquet and DB ingest process data in batches to bound memory and transaction scope.
 
 ## Results
-This stage reports visual sanity-check results from CLI-generated plots (source: generated by the agent from repository ingestion outputs, not notebook exports).
+All figures in this report are generated from repository pipeline outputs (agent-generated plot artifacts), not notebook exports.
 
-In Figure 1, Binance BTCUSDT M1 candles show continuous short-horizon movement without visible timestamp gaps in the sampled window.
+### Descriptive Statistics Table
+At this ingestion-baseline stage, descriptive statistics are not claimed as scientific findings because no fixed experiment configuration is locked in `REPORT.md` yet.
 
-[Open Figure 1 plot][plot-binance-btc]
+| Variable | Mean | Std | Min | Max |
+|---|---:|---:|---:|---:|
+| Open | N/A (config-dependent) | N/A | N/A | N/A |
+| High | N/A (config-dependent) | N/A | N/A | N/A |
+| Low | N/A (config-dependent) | N/A | N/A | N/A |
+| Close | N/A (config-dependent) | N/A | N/A | N/A |
+| Volume | N/A (config-dependent) | N/A | N/A | N/A |
 
-Interpretation: Figure 1 indicates the Binance adapter, timestamp parsing, and plotting path produce coherent minute-level sequencing for BTCUSDT.
+### Model Comparison Table
+No predictive or regime models are trained in this stage.
 
-In Figure 2, Binance ETHUSDT M1 candles show the same structurally consistent price/volume rendering pattern.
+| Model | Accuracy | Sharpe | AUC | RMSE |
+|---|---:|---:|---:|---:|
+| Not applicable (ingestion baseline) | N/A | N/A | N/A | N/A |
 
-[Open Figure 2 plot][plot-binance-eth]
+### Robustness Table
 
-Interpretation: Figure 2 supports that the same ingestion interface generalizes across multiple symbols on Binance without schema drift.
+| Configuration | Scope | Outcome |
+|---|---|---|
+| Multi-exchange fetch | Binance + Deribit + Bybit | Passed via typed adapter dispatch |
+| Gap-fill mode | Missing internal/tail intervals | Passed via open-time range recovery |
+| Incremental DB ingest | Parquet signatures + upsert | Passed with idempotent key policy |
 
-In Figure 3, Deribit BTCUSDT aliasing to Deribit spot instrument mapping renders a stable M1 series.
+### Figures
+Figure 1. Binance BTCUSDT 1m close series.
 
-[Open Figure 3 plot][plot-deribit-btc]
+![Figure 1: Binance BTCUSDT 1m close](docs/figures/plot_outputs/binance_BTCUSDT_1m_close.png)
 
-Interpretation: Figure 3 confirms symbol normalization and Deribit chart-data normalization preserve a valid minute-candle sequence.
+Interpretation: Figure 1 shows coherent minute-level sequencing for Binance after normalization and plotting.
 
-In Figure 4, Deribit ETHUSDT aliasing path similarly yields a continuous M1 chart.
+Figure 2. Binance ETHUSDT 1m close series.
 
-[Open Figure 4 plot][plot-deribit-eth]
+![Figure 2: Binance ETHUSDT 1m close](docs/figures/plot_outputs/binance_ETHUSDT_1m_close.png)
 
-Interpretation: Figure 4 shows consistent behavior across both tracked Deribit spot aliases, reducing integration risk for multi-symbol batch runs.
+Interpretation: Figure 2 indicates symbol-level generalization of the same normalization pipeline.
+
+Figure 3. Deribit BTCUSDT alias path to normalized spot instrument.
+
+![Figure 3: Deribit BTCUSDT 1m close](docs/figures/plot_outputs/deribit_BTCUSDT_1m_close.png)
+
+Interpretation: Figure 3 supports correctness of exchange-specific symbol mapping and timestamp handling.
+
+Figure 4. Deribit ETHUSDT alias path to normalized spot instrument.
+
+![Figure 4: Deribit ETHUSDT 1m close](docs/figures/plot_outputs/deribit_ETHUSDT_1m_close.png)
+
+Interpretation: Figure 4 confirms consistent behavior across multiple symbols on Deribit mappings.
 
 ## Discussion
-The baseline demonstrates that multi-exchange candle data can be ingested through a deterministic, testable interface. Current limitations include candles-only scope (no L2/funding yet) and lack of persistence.
+Business implications: a reliable ingestion substrate lowers operational risk for strategy research and accelerates feature engineering, backtesting, and monitoring deployment.
+
+Limitations: current scope is OHLCV-only; L2 order book, funding, and trade-level feeds are not yet integrated. Exchange-specific outages and schema changes still require active maintenance.
+
+Model weaknesses/assumptions: this stage does not perform inference; assumptions are engineering assumptions (timestamp consistency, endpoint availability, and exchange-provided data correctness).
 
 ## Conclusion
-Step 1 establishes a maintainable multi-exchange ingestion foundation for BTC/ETH candle data and enables immediate extension toward L2, funding, and database synchronization workflows.
+This baseline establishes a reproducible and extensible ingestion pipeline for multi-exchange crypto OHLCV data with typed normalization and idempotent persistence. The immediate value is production-quality data plumbing for future empirical studies. Next steps are fixed experiment configs, notebook-to-report automated statistics export, and model/evaluation modules with formal benchmarks.
 
 ## Appendix
-None for this stage.
+### Reproducibility Controls
+- Static checks: `ruff`, `mypy` (strict), `pytest`.
+- Deterministic interfaces: typed adapters and normalized candle schema.
+- Incremental persistence: parquet signature tracking and key-based DB upsert.
 
-[plot-binance-btc]: plots/binance_BTCUSDT_1m_close.png
-[plot-binance-eth]: plots/binance_ETHUSDT_1m_close.png
-[plot-deribit-btc]: plots/deribit_BTCUSDT_1m_close.png
-[plot-deribit-eth]: plots/deribit_ETHUSDT_1m_close.png
+## References
+1. Engle, R. F. (1982). Autoregressive Conditional Heteroskedasticity with Estimates of the Variance of U.K. Inflation. *Econometrica*.
+2. Bollerslev, T. (1986). Generalized Autoregressive Conditional Heteroskedasticity. *Journal of Econometrics*.
+3. Hamilton, J. D. (1989). A New Approach to the Economic Analysis of Nonstationary Time Series and the Business Cycle. *Econometrica*.
+4. Andersen, T. G., Bollerslev, T., Diebold, F. X., and Labys, P. (2001). The Distribution of Realized Exchange Rate Volatility. *Journal of the American Statistical Association*.
+5. Barndorff-Nielsen, O. E., and Shephard, N. (2002). Econometric Analysis of Realised Volatility and Its Use in Estimating Stochastic Volatility Models. *Journal of the Royal Statistical Society: Series B*.
+6. Binance Developer Documentation. Kline/Candlestick Data Endpoints.
+7. Deribit API Documentation. TradingView Chart Data Endpoint.
+8. Bybit API Documentation. Market Kline Endpoint.
+9. Timescale Documentation. Hypertables and Time-Series Ingestion Best Practices.
+10. Apache Arrow Documentation. Parquet RecordBatch Processing.
