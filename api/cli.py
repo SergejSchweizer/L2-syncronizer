@@ -28,7 +28,7 @@ from ingestion.open_interest import (
     normalize_open_interest_timeframe,
     open_interest_interval_to_milliseconds,
 )
-from ingestion.plotting import PriceField, save_candle_plots
+from ingestion.plotting import PriceField, save_candle_plots, save_open_interest_plot
 from ingestion.spot import (
     Exchange,
     Market,
@@ -45,6 +45,7 @@ LOGGER_NAME = "crypto_l2_loader"
 DEFAULT_LOG_DIR = "/volume1/Temp/logs"
 DEFAULT_EXPORT_DIR = "/volume1/Temp/crypto"
 DatasetType = str
+CliMarket = str
 
 
 class SingleInstanceError(RuntimeError):
@@ -307,6 +308,12 @@ def _grouped_plot_filename(exchange: str, symbol: str, timeframe: str) -> str:
     return f"{exchange}_{symbol}_{timeframe}_full.png"
 
 
+def _grouped_open_interest_plot_filename(exchange: str, symbol: str, timeframe: str) -> str:
+    """Build open-interest plot filename for one exchange/symbol/timeframe group."""
+
+    return f"{exchange}_{symbol}_{timeframe}_open_interest.png"
+
+
 def build_parser() -> argparse.ArgumentParser:
     """Create top-level CLI parser."""
 
@@ -324,9 +331,9 @@ def build_parser() -> argparse.ArgumentParser:
     spot_parser.add_argument(
         "--market",
         nargs="+",
-        choices=["spot", "perp"],
+        choices=["spot", "perp", "oi"],
         default=["spot"],
-        help="One or more markets to fetch, e.g. --market spot perp",
+        help="One or more market modes to fetch, e.g. --market spot perp oi",
     )
     spot_parser.add_argument(
         "--symbols",
@@ -358,13 +365,6 @@ def build_parser() -> argparse.ArgumentParser:
         "--save-parquet-lake",
         action="store_true",
         help="Save fetched candles to parquet lake partitions",
-    )
-    spot_parser.add_argument(
-        "--datasets",
-        nargs="+",
-        choices=["ohlcv", "open_interest"],
-        default=["ohlcv"],
-        help="Datasets to fetch/save. open_interest currently supports perp on Binance.",
     )
     spot_parser.add_argument(
         "--lake-root",
@@ -444,9 +444,9 @@ def build_parser() -> argparse.ArgumentParser:
         help="Optional max rows",
     )
     export_parser.add_argument(
-        "--include-open-interest",
+        "--no-open-interest",
         action="store_true",
-        help="Join open_interest dataset into exported dataframes when available.",
+        help="Disable open_interest join during export.",
     )
     export_parser.add_argument(
         "--no-json-output",
@@ -469,15 +469,17 @@ def main() -> None:
         try:
             with SingleInstanceLock(".run/crypto-l2-loader.lock"):
                 exchanges = cast(list[Exchange], args.exchanges if args.exchanges else [args.exchange])
-                markets = cast(list[Market], args.market)
-                multi_market = len(markets) > 1
+                cli_markets = cast(list[CliMarket], args.market)
+                ohlcv_markets = [item for item in cli_markets if item in {"spot", "perp"}]
+                oi_requested = "oi" in cli_markets
+                multi_market = len(cli_markets) > 1
                 requested_timeframes = cast(list[str], args.timeframes if args.timeframes else [args.timeframe])
                 multi_timeframe = len(requested_timeframes) > 1
-                selected_datasets = cast(list[DatasetType], args.datasets)
                 output: dict[str, object] = {}
                 candles_for_storage: dict[Market, dict[str, dict[str, list[SpotCandle]]]] = {}
                 open_interest_for_storage: dict[Market, dict[str, dict[str, list[OpenInterestPoint]]]] = {}
                 tasks: list[tuple[Exchange, Market, str, str]] = []
+                oi_tasks: list[tuple[Exchange, str, str]] = []
 
                 for exchange in exchanges:
                     exchange_output: dict[str, object] = {}
@@ -495,14 +497,19 @@ def main() -> None:
                             )
                     if not normalized_timeframes:
                         continue
-                    for market in markets:
+                    for market in cast(list[Market], ohlcv_markets):
                         for timeframe in normalized_timeframes:
                             for symbol in args.symbols:
                                 tasks.append((exchange, market, symbol, timeframe))
+                    if oi_requested:
+                        for timeframe in normalized_timeframes:
+                            for symbol in args.symbols:
+                                oi_tasks.append((exchange, symbol, timeframe))
 
                 task_results: dict[tuple[Exchange, Market, str, str], list[SpotCandle]] = {}
-                oi_results: dict[tuple[Exchange, Market, str, str], list[OpenInterestPoint]] = {}
+                oi_results: dict[tuple[Exchange, str, str], list[OpenInterestPoint]] = {}
                 task_errors: dict[tuple[Exchange, Market, str, str], str] = {}
+                oi_errors: dict[tuple[Exchange, str, str], str] = {}
                 total_tasks = len(tasks)
                 for idx, (exchange, market, symbol, timeframe) in enumerate(tasks, start=1):
                     key = (exchange, market, symbol, timeframe)
@@ -517,24 +524,15 @@ def main() -> None:
                             "auto-bootstrap-or-gap-fill",
                     )
                     try:
-                        if "ohlcv" in selected_datasets:
-                            task_results[key] = _fetch_symbol_candles(
-                                exchange=exchange,
-                                market=market,
-                                symbol=symbol,
-                                timeframe=timeframe,
-                                lake_root=args.lake_root,
-                            )
-                        if "open_interest" in selected_datasets:
-                            oi_results[key] = _fetch_symbol_open_interest(
-                                exchange=exchange,
-                                market=market,
-                                symbol=symbol,
-                                timeframe=timeframe,
-                                lake_root=args.lake_root,
-                            )
+                        task_results[key] = _fetch_symbol_candles(
+                            exchange=exchange,
+                            market=market,
+                            symbol=symbol,
+                            timeframe=timeframe,
+                            lake_root=args.lake_root,
+                        )
                         logger.info(
-                            "Fetch complete [%s/%s] exchange=%s market=%s symbol=%s timeframe=%s candles=%s oi=%s",
+                            "Fetch complete [%s/%s] exchange=%s market=%s symbol=%s timeframe=%s candles=%s",
                             idx,
                             total_tasks,
                             exchange,
@@ -542,7 +540,6 @@ def main() -> None:
                             symbol,
                             timeframe,
                             len(task_results.get(key, [])),
-                            len(oi_results.get(key, [])),
                         )
                     except Exception as exc:  # noqa: BLE001
                         task_errors[key] = str(exc)
@@ -550,6 +547,43 @@ def main() -> None:
                             "Fetch failed exchange=%s market=%s symbol=%s timeframe=%s",
                             exchange,
                             market,
+                            symbol,
+                            timeframe,
+                        )
+                oi_total = len(oi_tasks)
+                for idx, (exchange, symbol, timeframe) in enumerate(oi_tasks, start=1):
+                    oi_key = (exchange, symbol, timeframe)
+                    logger.info(
+                        "OI fetch start [%s/%s] exchange=%s market=oi symbol=%s timeframe=%s mode=%s",
+                        idx,
+                        oi_total,
+                        exchange,
+                        symbol,
+                        timeframe,
+                        "auto-bootstrap-or-gap-fill",
+                    )
+                    try:
+                        oi_results[oi_key] = _fetch_symbol_open_interest(
+                            exchange=exchange,
+                            market="perp",
+                            symbol=symbol,
+                            timeframe=timeframe,
+                            lake_root=args.lake_root,
+                        )
+                        logger.info(
+                            "OI fetch complete [%s/%s] exchange=%s symbol=%s timeframe=%s rows=%s",
+                            idx,
+                            oi_total,
+                            exchange,
+                            symbol,
+                            timeframe,
+                            len(oi_results.get(oi_key, [])),
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        oi_errors[oi_key] = str(exc)
+                        logger.exception(
+                            "OI fetch failed exchange=%s symbol=%s timeframe=%s",
+                            exchange,
                             symbol,
                             timeframe,
                         )
@@ -583,24 +617,55 @@ def main() -> None:
                         plot_key = symbol_key
                     exchange_candles[plot_key] = candles
 
-                    if "open_interest" in selected_datasets:
-                        oi_by_market = open_interest_for_storage.setdefault(market, {})
+                if oi_requested:
+                    for exchange, symbol, timeframe in oi_tasks:
+                        symbol_key = symbol.upper()
+                        oi_key = (exchange, symbol, timeframe)
+                        exchange_output = cast(dict[str, object], output[exchange])
+                        if multi_market:
+                            market_bucket = cast(dict[str, object], exchange_output.setdefault("oi", {}))
+                        else:
+                            market_bucket = exchange_output
+                        if multi_timeframe:
+                            timeframe_bucket = cast(dict[str, object], market_bucket.setdefault(timeframe, {}))
+                        else:
+                            timeframe_bucket = market_bucket
+                        if oi_key in oi_errors:
+                            timeframe_bucket[symbol_key] = {"error": oi_errors[oi_key]}
+                            continue
+                        oi_rows = oi_results.get(oi_key, [])
+                        timeframe_bucket[symbol_key] = [
+                            {
+                                "exchange": item.exchange,
+                                "symbol": item.symbol,
+                                "interval": item.interval,
+                                "open_time": item.open_time.isoformat(),
+                                "close_time": item.close_time.isoformat(),
+                                "open_interest": item.open_interest,
+                                "open_interest_value": item.open_interest_value,
+                            }
+                            for item in oi_rows
+                        ]
+                        oi_by_market = open_interest_for_storage.setdefault("perp", {})
                         oi_exchange_rows = oi_by_market.setdefault(exchange, {})
-                        oi_exchange_rows[plot_key] = oi_results.get(result_key, [])
+                        if multi_timeframe:
+                            oi_plot_key = f"{symbol_key}__{timeframe}"
+                        else:
+                            oi_plot_key = symbol_key
+                        oi_exchange_rows[oi_plot_key] = oi_rows
 
                 if args.save_parquet_lake:
                     try:
                         parquet_files: list[str] = []
-                        if "ohlcv" in selected_datasets:
-                            for market_key, candles_by_exchange in candles_for_storage.items():
-                                parquet_files.extend(
-                                    save_spot_candles_parquet_lake(
-                                        candles_by_exchange=candles_by_exchange,
-                                        market=market_key,
-                                        lake_root=args.lake_root,
-                                    )
+                        for market_key, candles_by_exchange in candles_for_storage.items():
+                            parquet_files.extend(
+                                save_spot_candles_parquet_lake(
+                                    candles_by_exchange=candles_by_exchange,
+                                    market=market_key,
+                                    lake_root=args.lake_root,
                                 )
-                        if "open_interest" in selected_datasets:
+                            )
+                        if oi_requested:
                             for market_key, oi_by_exchange in open_interest_for_storage.items():
                                 parquet_files.extend(
                                     save_open_interest_parquet_lake(
@@ -615,7 +680,7 @@ def main() -> None:
                         logger.exception("Parquet lake write failed")
 
                 if args.plot:
-                    if "ohlcv" not in selected_datasets:
+                    if not ohlcv_markets:
                         output["_plot_info"] = "No OHLCV dataset selected; skipping plot generation."
                         if not args.no_json_output:
                             print(json.dumps(output, indent=2))
@@ -697,7 +762,7 @@ def main() -> None:
             start_time=start_time,
             end_time=end_time,
             limit=cast(int | None, args.limit),
-            include_open_interest=bool(args.include_open_interest),
+            include_open_interest=not bool(args.no_open_interest),
         )
 
         output_arg = cast(str | None, args.output)
@@ -707,6 +772,7 @@ def main() -> None:
         grouped = dataframe.groupby(["exchange", "symbol", "timeframe"], dropna=False, sort=True)
         output_paths: list[str] = []
         plot_paths: list[str] = []
+        oi_plot_paths: list[str] = []
         generated_files: list[dict[str, object]] = []
         group_count = 0
         for group_key, group_frame in grouped:
@@ -769,6 +835,26 @@ def main() -> None:
                     )
                     Path(generated_plot_paths[0]).replace(target_plot)
                     plot_paths.append(str(target_plot.resolve()))
+
+            oi_plot_file: str | None = None
+            if "open_interest" in group_frame.columns:
+                oi_frame = group_frame.dropna(subset=["open_interest"])
+                if not oi_frame.empty:
+                    oi_frame = oi_frame.sort_values(by=["open_time"], kind="mergesort")
+                    oi_output_path = output_dir / _grouped_open_interest_plot_filename(
+                        exchange=str(exchange_value),
+                        symbol=str(symbol_value),
+                        timeframe=str(timeframe_value),
+                    )
+                    oi_plot_file = save_open_interest_plot(
+                        exchange=str(exchange_value),
+                        symbol=str(symbol_value),
+                        interval=str(timeframe_value),
+                        times=list(oi_frame["open_time"]),
+                        open_interest_values=[float(item) for item in oi_frame["open_interest"]],
+                        output_path=str(oi_output_path),
+                    )
+                    oi_plot_paths.append(oi_plot_file)
             time_start = None
             time_end = None
             if not group_frame.empty and "open_time" in group_frame:
@@ -786,6 +872,7 @@ def main() -> None:
                         symbol=str(symbol_value),
                         timeframe=str(timeframe_value),
                     )).resolve()),
+                    "open_interest_plot_file": oi_plot_file,
                     "rows": int(getattr(group_frame, "shape", (0, 0))[0]),
                     "start_open_time": time_start.isoformat() if isinstance(time_start, datetime) else None,
                     "end_open_time": time_end.isoformat() if isinstance(time_end, datetime) else None,
@@ -797,6 +884,7 @@ def main() -> None:
             "output_dir": str(output_dir.resolve()),
             "outputs": output_paths,
             "plots": plot_paths,
+            "open_interest_plots": oi_plot_paths,
             "generated_files": generated_files,
             "format": args.format,
             "groups": group_count,

@@ -197,10 +197,10 @@ Save loaded data to parquet lake format:
 python3 main.py loader --exchanges binance deribit --market spot --symbols BTC ETH --timeframe H1 --save-parquet-lake --lake-root lake/bronze
 ```
 
-Fetch both OHLCV and open interest (perp):
+Fetch OHLCV (spot+perp) and open interest in one run by including market `oi`:
 
 ```bash
-python3 main.py loader --exchanges binance --market perp --symbols BTC ETH --timeframe 5m --datasets ohlcv open_interest --save-parquet-lake --lake-root lake/bronze
+python3 main.py loader --exchanges binance --market spot perp oi --symbols BTC ETH --timeframe 5m --save-parquet-lake --lake-root lake/bronze
 ```
 
 Parquet lake write mode uses a stable file per partition (`data.parquet`) with staged merge+rewrite on each run to keep file counts bounded. Partition schema:
@@ -250,10 +250,16 @@ Export combined spot/perp dataset from parquet lake as a dataframe file:
 python3 main.py export-df --lake-root lake/bronze --format parquet --output exports --instrument-types spot perp --exchanges binance deribit --timeframes 1m
 ```
 
-Include open interest columns in export when available:
+Open interest columns are included by default:
 
 ```bash
-python3 main.py export-df --lake-root lake/bronze --format parquet --output exports --include-open-interest
+python3 main.py export-df --lake-root lake/bronze --format parquet --output exports
+```
+
+Disable open interest join explicitly:
+
+```bash
+python3 main.py export-df --lake-root lake/bronze --format parquet --output exports --no-open-interest
 ```
 
 Export writes one file per `exchange_symbol_timeframe`.
@@ -289,30 +295,37 @@ python3 main.py list-spot-timeframes --exchange deribit
 python3 main.py list-spot-timeframes --exchanges binance deribit
 ```
 
-## 7. Example Plots
+## 7. Datatype Plots
 
-The following links point to runtime plot outputs under `plots/` (refreshed by scheduled/cron runs).
+### 7.1 OHLCV (Spot)
+Description:
+OHLCV spot rows capture exchange-traded candle bars for cash markets. Exported dataframes are grouped per `exchange_symbol_timeframe`.
 
-### Figure 1. Binance BTCUSDT (M1 close)
+Plot:
+`<output_dir>/<exchange>_<symbol>_<timeframe>_full.png` (price + volume).
 
-[Open Figure 1 plot][plot-binance-btc]
+Example:
+`/volume1/Temp/crypto/binance_BTCUSDT_1m_full.png`
 
-### Figure 2. Binance ETHUSDT (M1 close)
+### 7.2 OHLCV (Perp)
+Description:
+Perpetual OHLCV rows follow the same candle schema and are combined with spot rows in the same grouped dataframe when both exist.
 
-[Open Figure 2 plot][plot-binance-eth]
+Plot:
+`<output_dir>/<exchange>_<symbol>_<timeframe>_full.png` (price + volume, includes perp rows present in the group).
 
-### Figure 3. Deribit BTCUSDT alias -> BTC_USDC (M1 close)
+Example:
+`/volume1/Temp/crypto/binance_BTCUSDT_1m_full.png`
 
-[Open Figure 3 plot][plot-deribit-btc]
+### 7.3 Open Interest (OI)
+Description:
+Open-interest rows are stored under `dataset_type=open_interest` and are joined into exports by default (unless `--no-open-interest` is set).
 
-### Figure 4. Deribit ETHUSDT alias -> ETH_USDC (M1 close)
+Plot:
+`<output_dir>/<exchange>_<symbol>_<timeframe>_open_interest.png` (OI time-series line chart).
 
-[Open Figure 4 plot][plot-deribit-eth]
-
-[plot-binance-btc]: plots/binance_BTCUSDT_1m_close.png
-[plot-binance-eth]: plots/binance_ETHUSDT_1m_close.png
-[plot-deribit-btc]: plots/deribit_BTCUSDT_1m_close.png
-[plot-deribit-eth]: plots/deribit_ETHUSDT_1m_close.png
+Example:
+`/volume1/Temp/crypto/binance_BTCUSDT_1m_open_interest.png`
 
 ## 8. Testing Instructions
 

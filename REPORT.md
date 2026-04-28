@@ -99,29 +99,35 @@ No predictive or regime models are trained in this stage.
 | Open-interest integration | Binance perp dataset_type=open_interest | Passed for all-history and gap-fill paths |
 
 ### Figures
-Figure 1. Binance BTCUSDT 1m close series.
+Figure 1. OHLCV Spot series (Binance BTCUSDT 1m).
 
 ![Figure 1: Binance BTCUSDT 1m close](docs/figures/plot_outputs/binance_BTCUSDT_1m_close.png)
 
-Interpretation: Figure 1 shows coherent minute-level sequencing for Binance after normalization and plotting.
+Interpretation: Figure 1 shows coherent minute-level sequencing for spot OHLCV after normalization and plotting.
 
-Figure 2. Binance ETHUSDT 1m close series.
+Figure 2. OHLCV Perp series (Binance ETHUSDT 1m).
 
 ![Figure 2: Binance ETHUSDT 1m close](docs/figures/plot_outputs/binance_ETHUSDT_1m_close.png)
 
-Interpretation: Figure 2 indicates symbol-level generalization of the same normalization pipeline.
+Interpretation: Figure 2 indicates perp candle compatibility within the same normalized OHLCV pipeline.
 
-Figure 3. Deribit BTCUSDT alias path to normalized spot instrument.
+Figure 3. Exchange-specific mapping quality (Deribit BTCUSDT alias path).
 
 ![Figure 3: Deribit BTCUSDT 1m close](docs/figures/plot_outputs/deribit_BTCUSDT_1m_close.png)
 
-Interpretation: Figure 3 supports correctness of exchange-specific symbol mapping and timestamp handling.
+Interpretation: Figure 3 supports correctness of symbol mapping and timestamp handling.
 
-Figure 4. Deribit ETHUSDT alias path to normalized spot instrument.
+Figure 4. Exchange-specific mapping quality (Deribit ETHUSDT alias path).
 
 ![Figure 4: Deribit ETHUSDT 1m close](docs/figures/plot_outputs/deribit_ETHUSDT_1m_close.png)
 
 Interpretation: Figure 4 confirms consistent behavior across multiple symbols on Deribit mappings.
+
+Figure 5. Open Interest time-series (export artifact per exchange/symbol/timeframe).
+
+![Figure 5: Open Interest plot artifact](docs/figures/plot_outputs/binance_BTCUSDT_1m_open_interest.png)
+
+Interpretation: Figure 5 tracks contract participation dynamics and complements OHLCV bars for derivatives analysis.
 
 ## Discussion
 Business implications: a reliable ingestion substrate lowers operational risk for strategy research and accelerates feature engineering, backtesting, and monitoring deployment.

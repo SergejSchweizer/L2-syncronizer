@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+from datetime import datetime
 from pathlib import Path
 from typing import Literal
 
@@ -163,3 +164,55 @@ def save_candle_plots(
             saved_paths.append(str(file_path.resolve()))
 
     return saved_paths
+
+
+def save_open_interest_plot(
+    exchange: str,
+    symbol: str,
+    interval: str,
+    times: list[datetime],
+    open_interest_values: list[float],
+    output_path: str,
+) -> str:
+    """Render and save one open-interest line plot."""
+
+    if not times or not open_interest_values:
+        return output_path
+
+    try:
+        import matplotlib.dates as mdates
+        import matplotlib.pyplot as plt
+        import matplotlib.ticker as mticker
+    except ImportError as exc:
+        raise RuntimeError("matplotlib is required for plotting. Install project dependencies first.") from exc
+
+    figure, axis = plt.subplots(figsize=(12, 4))
+    figure.patch.set_facecolor("#f7f9fc")
+    axis.set_facecolor("#fdfefe")
+    axis.grid(alpha=0.2, linestyle="--", linewidth=0.8, color="#8aa0b5")
+    axis.spines["top"].set_visible(False)
+    axis.spines["right"].set_visible(False)
+    axis.spines["left"].set_color("#8aa0b5")
+    axis.spines["bottom"].set_color("#8aa0b5")
+
+    axis.plot(times, open_interest_values, color="#0f766e", linewidth=2.0)  # type: ignore[arg-type]
+    axis.fill_between(times, open_interest_values, min(open_interest_values), color="#14b8a6", alpha=0.12)  # type: ignore[arg-type]
+    axis.set_title(
+        f"{exchange.upper()}  {symbol}  ({interval})  Open Interest",
+        fontsize=12,
+        fontweight="semibold",
+        color="#0f172a",
+        pad=10,
+    )
+    axis.set_ylabel("open interest", color="#334155")
+    axis.yaxis.set_major_formatter(mticker.StrMethodFormatter("{x:,.0f}"))
+    axis.set_xlabel("time (UTC)", color="#334155")
+    axis.xaxis.set_major_formatter(mdates.DateFormatter("%m.%Y"))  # type: ignore[no-untyped-call]
+    figure.autofmt_xdate()
+    figure.tight_layout()
+
+    path = Path(output_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    figure.savefig(path, dpi=180)
+    plt.close(figure)
+    return str(path.resolve())
