@@ -237,7 +237,9 @@ Export writes one file per `exchange_symbol_timeframe`.
 Each file contains both `spot` and `perp` rows for that group (if available in lake data).
 For each exported dataframe file, a matching full plot (`spot` price + volume) is also saved
 with the same base name and `.png` extension.
-If `--output` is omitted, files are written to current directory.
+If `--output` is omitted, files are written to `/volume1/Temp/crypto`.
+The export JSON summary includes extended per-file metadata in `generated_files`
+(data file path, plot file path, row count, and start/end `open_time` range).
 
 Examples:
 - `binance_BTCUSDT_1m_full.csv`

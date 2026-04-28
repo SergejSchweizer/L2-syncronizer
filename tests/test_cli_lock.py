@@ -150,7 +150,7 @@ def test_main_loader_command_still_uses_single_instance_lock(
         cli.main()
 
 
-def test_main_export_combined_df_does_not_acquire_single_instance_lock(
+def test_main_export_df_does_not_acquire_single_instance_lock(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -292,6 +292,8 @@ def test_main_export_df_uses_default_output_name_from_filters(
             "export-df",
             "--format",
             "csv",
+            "--output",
+            str(tmp_path),
             "--exchanges",
             "binance",
             "--symbols",

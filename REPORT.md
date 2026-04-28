@@ -60,6 +60,7 @@ Upsert policy enforces idempotency:
 - Gap-fill computes missing intervals from stored open-time sets.
 - Fetch execution is sequential across exchange/market/symbol/timeframe tasks.
 - Parquet reads/writes process data in batches to bound memory usage.
+- Export stage writes one dataset per `(exchange, symbol, timeframe)` and stores matching price/volume plots and time-range metadata.
 
 ## Results
 All figures in this report are generated from repository pipeline outputs (agent-generated plot artifacts), not notebook exports.
@@ -89,6 +90,7 @@ No predictive or regime models are trained in this stage.
 | Multi-exchange fetch | Binance + Deribit + Bybit | Passed via typed adapter dispatch |
 | Gap-fill mode | Missing internal/tail intervals | Passed via open-time range recovery |
 | Incremental parquet persistence | Partition merge + natural-key dedup | Passed with idempotent key policy |
+| Grouped export artifacts | Per `(exchange, symbol, timeframe)` dataframe + plot | Passed with per-file range metadata |
 
 ### Figures
 Figure 1. Binance BTCUSDT 1m close series.

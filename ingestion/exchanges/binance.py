@@ -55,7 +55,7 @@ def interval_to_milliseconds(interval: str) -> int:
     if interval.endswith("w"):
         return int(interval[:-1]) * 7 * 86_400_000
     if interval.endswith("M"):
-        raise ValueError("Monthly interval is not supported for gap-fill mode. Use --limit with 1M.")
+        raise ValueError("Monthly interval is not supported for gap-fill mode.")
     raise ValueError(f"Unsupported interval '{interval}'")
 
 

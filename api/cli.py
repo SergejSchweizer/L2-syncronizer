@@ -34,6 +34,7 @@ from ingestion.spot import (
 
 LOGGER_NAME = "crypto_l2_loader"
 DEFAULT_LOG_DIR = "/volume1/Temp/logs"
+DEFAULT_EXPORT_DIR = "/volume1/Temp/crypto"
 
 
 class SingleInstanceError(RuntimeError):
@@ -335,7 +336,7 @@ def build_parser() -> argparse.ArgumentParser:
     export_parser.add_argument(
         "--output",
         default=None,
-        help="Output directory for dataframe exports. Defaults to current directory.",
+        help=f"Output directory for dataframe/plot exports. Defaults to {DEFAULT_EXPORT_DIR}.",
     )
     export_parser.add_argument(
         "--format",
@@ -598,7 +599,7 @@ def main() -> None:
         )
 
         output_arg = cast(str | None, args.output)
-        output_dir = Path(output_arg) if output_arg else Path(".")
+        output_dir = Path(output_arg) if output_arg else Path(DEFAULT_EXPORT_DIR)
         output_dir.mkdir(parents=True, exist_ok=True)
 
         grouped = dataframe.groupby(["exchange", "symbol", "timeframe"], dropna=False, sort=True)
