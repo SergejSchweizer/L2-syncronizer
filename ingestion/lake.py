@@ -259,6 +259,52 @@ def load_spot_candles_from_lake(
     return [candles_by_open_time[key] for key in sorted(candles_by_open_time)]
 
 
+def load_open_interest_from_lake(
+    lake_root: str,
+    market: str,
+    exchange: str,
+    symbol: str,
+    timeframe: str,
+) -> list[OpenInterestPoint]:
+    """Load all stored open-interest rows for one exchange/symbol/timeframe from parquet lake."""
+
+    try:
+        import pyarrow.parquet as pq
+    except ImportError as exc:
+        raise RuntimeError("pyarrow is required for parquet lake output. Install project dependencies.") from exc
+
+    partition_root = (
+        Path(lake_root)
+        / "dataset_type=open_interest"
+        / f"exchange={exchange}"
+        / f"instrument_type={market}"
+        / f"symbol={symbol}"
+        / f"timeframe={timeframe}"
+    )
+    if not partition_root.exists():
+        return []
+
+    items_by_open_time: dict[datetime, OpenInterestPoint] = {}
+    for data_file in sorted(partition_root.glob("date=*/data.parquet")):
+        parquet_file = pq.ParquetFile(data_file)  # type: ignore[no-untyped-call]
+        for batch in parquet_file.iter_batches(batch_size=10_000):  # type: ignore[no-untyped-call]
+            for row in batch.to_pylist():
+                open_time = row.get("open_time")
+                close_time = row.get("close_time")
+                if not isinstance(open_time, datetime) or not isinstance(close_time, datetime):
+                    continue
+                items_by_open_time[open_time] = OpenInterestPoint(
+                    exchange=str(row.get("exchange", exchange)),
+                    symbol=str(row.get("symbol", symbol)),
+                    interval=str(row.get("timeframe", timeframe)),
+                    open_time=open_time,
+                    close_time=close_time,
+                    open_interest=float(row.get("open_interest", 0.0)),
+                    open_interest_value=float(row.get("open_interest_value", 0.0)),
+                )
+    return [items_by_open_time[key] for key in sorted(items_by_open_time)]
+
+
 def save_spot_candles_parquet_lake(
     candles_by_exchange: dict[str, dict[str, list[SpotCandle]]],
     market: str,

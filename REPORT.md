@@ -1,4 +1,4 @@
-# Multi-Exchange OHLCV Ingestion Baseline for Crypto Research Pipelines
+# Deribit OHLCV Ingestion Baseline for Crypto Research Pipelines
 
 ## Abstract
 This report presents a production-oriented baseline for cryptocurrency candle ingestion designed to support downstream quantitative research. The problem addressed is the lack of reproducible, maintainable ingestion layers in early-stage quant projects, where exchange-specific scripts and schema drift frequently undermine empirical validity. We implement a typed, modular ingestion pipeline with adapter abstractions for Deribit, a command-line interface for deterministic execution (including multi-market runs such as `--market spot perp`), and partitioned parquet-lake storage. Data are sourced from public exchange REST endpoints and normalized into a canonical OHLCV schema with metadata fields for run traceability. The main finding is engineering-focused: the system provides deterministic normalization, supports backward pagination and gap-fill synchronization, and preserves idempotent persistence via natural-key partition merges. The contribution is a maintainable ingestion foundation suitable for subsequent market microstructure, regime, and forecasting studies, with explicit reproducibility controls (strict typing, tests, linting, and stable execution commands).
@@ -10,9 +10,9 @@ Reliable market-data ingestion is a prerequisite for valid quantitative inferenc
 
 Many practical pipelines fail due to exchange-specific one-off scripts, inconsistent timestamp handling, and weak reproducibility controls.
 
-This project proposes a modular ingestion architecture with typed interfaces, explicit normalization, and reproducible command-line workflows.
+This project proposes a modular ingestion architecture with typed interfaces, explicit normalization, and reproducible command-line workflows focused on Deribit as the current production exchange.
 
-The contributions of this stage are: (1) cross-exchange OHLCV normalization, (2) parquet-lake persistence paths, and (3) tested operational workflows for repeatable data acquisition.
+The contributions of this stage are: (1) Deribit OHLCV normalization, (2) parquet-lake persistence paths, and (3) tested operational workflows for repeatable data acquisition.
 
 ## Literature Review
 Volatility clustering and regime dependence motivate robust historical market-data pipelines. ARCH/GARCH foundations establish heteroskedastic behavior in financial time series, requiring high-integrity timestamped observations (Engle, 1982; Bollerslev, 1986). Regime-switching frameworks further highlight sensitivity to data quality and temporal consistency (Hamilton, 1989). Later work on high-frequency econometrics and realized-volatility estimation reinforces the need for reliable, granular data ingestion and synchronization processes (Andersen et al., 2001; Barndorff-Nielsen and Shephard, 2002).
@@ -67,7 +67,7 @@ Within crypto-specific empirical work, market microstructure studies and liquidi
   Same canonical OHLCV schema as `spot`; this enables direct cross-market comparisons without extra schema transforms.
 - Field construction logic:
   - Same parser and storage mapping as `spot` (`SpotCandle` normalization path).
-  - Symbol normalization is exchange/market specific before parse (for example Deribit `BTC` -> `BTC-PERPETUAL`, Binance/Bybit `BTC` -> `BTCUSDT`).
+  - Symbol normalization is exchange/market specific before parse (for example Deribit `BTC` -> `BTC-PERPETUAL`).
 
 #### `oi` (perpetual open interest)
 - Constructed fields:
@@ -79,8 +79,6 @@ Within crypto-specific empirical work, market microstructure studies and liquidi
   - `open_interest` is mapped from exchange OI position-size field.
   - `open_interest_value` is populated when the source returns a notional/value metric; else `0.0`.
 - Exchange-specific mapping:
-  - Binance: `open_interest <- sumOpenInterest`, `open_interest_value <- sumOpenInterestValue` (fallback `0.0`).
-  - Bybit: `open_interest <- openInterest`, `open_interest_value <- 0.0` (not in mapped payload).
   - Deribit: settlement `timestamp` is bucketed to the requested timeframe prior to interval construction; `open_interest <- position`, `open_interest_value <- 0.0`.
 
 ## Methodology
@@ -163,7 +161,7 @@ No predictive or regime models are trained in this stage.
 | Canonical schema contract tests | CLI datatype to storage contract mapping | Passed (`tests/test_schema_contract.py`) |
 | Loader sample artifacts | Per market/exchange/symbol/timeframe CSV + full-history plot | Passed with deterministic naming |
 | Chunked Timescale ingest | Streaming parquet read + bounded DB upsert batches | Passed with stable memory profile |
-| Open-interest integration | Binance perp dataset_type=open_interest | Passed for all-history and gap-fill paths |
+| Open-interest integration | Deribit perp dataset_type=open_interest | Passed for all-history and gap-fill paths |
 
 ### Figures
 Figure 1. OHLCV Spot series (Deribit BTCUSDT 1m).
@@ -204,7 +202,7 @@ Limitations: current scope is OHLCV-only; L2 order book, funding, and trade-leve
 Model weaknesses/assumptions: this stage does not perform inference; assumptions are engineering assumptions (timestamp consistency, endpoint availability, and exchange-provided data correctness).
 
 ## Conclusion
-This baseline establishes a reproducible and extensible ingestion pipeline for multi-exchange crypto OHLCV data with typed normalization and idempotent persistence. The immediate value is production-quality data plumbing for future empirical studies. Next steps are fixed experiment configs, notebook-to-report metrics automation, and model/evaluation modules with formal benchmarks.
+This baseline establishes a reproducible and extensible ingestion pipeline for Deribit crypto OHLCV data with typed normalization and idempotent persistence. The immediate value is production-quality data plumbing for future empirical studies. Next steps are fixed experiment configs, notebook-to-report metrics automation, and model/evaluation modules with formal benchmarks.
 
 ## Appendix
 ### Reproducibility Controls

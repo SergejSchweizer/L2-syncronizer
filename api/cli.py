@@ -16,20 +16,26 @@ from typing import Literal, cast
 
 import pandas as pd
 
-from application.services.artifact_service import write_loader_samples
+from application.dto import (
+    ArtifactOptionsDTO,
+    CandleFetchTaskDTO,
+    LoaderStorageDTO,
+    OpenInterestFetchTaskDTO,
+    PersistOptionsDTO,
+)
+from application.services.artifact_service import write_loader_samples_dto
 from application.services.fetch_service import (
-    CandleFetchTask,
-    OpenInterestFetchTask,
     fetch_candle_tasks_parallel,
     fetch_open_interest_tasks_parallel,
     fetch_symbol_candles,
     fetch_symbol_open_interest,
 )
 from application.services.gapfill_service import _last_closed_open_ms, _missing_ranges_ms
-from application.services.storage_service import persist_loader_outputs
+from application.services.storage_service import persist_loader_outputs_dto
 from infra.timescaledb import save_market_data_to_timescaledb, save_parquet_lake_to_timescaledb
 from ingestion.lake import (
     load_combined_dataframe_from_lake,
+    load_open_interest_from_lake,
     load_spot_candles_from_lake,
     open_times_in_lake,
     open_times_in_lake_by_dataset,
@@ -41,7 +47,6 @@ from ingestion.open_interest import (
     normalize_open_interest_timeframe,
     open_interest_interval_to_milliseconds,
 )
-from ingestion.plotting import PriceField, save_candle_plots
 from ingestion.spot import (
     Exchange,
     Market,
@@ -216,16 +221,17 @@ async def _fetch_candle_tasks_parallel(
     """Fetch OHLCV tasks concurrently with bounded parallelism."""
 
     service_tasks = [
-        CandleFetchTask(exchange=exchange, market=market, symbol=symbol, timeframe=timeframe)
+        CandleFetchTaskDTO(exchange=exchange, market=market, symbol=symbol, timeframe=timeframe)
         for exchange, market, symbol, timeframe in tasks
     ]
-    return await fetch_candle_tasks_parallel(
+    result = await fetch_candle_tasks_parallel(
         tasks=service_tasks,
         lake_root=lake_root,
         concurrency=concurrency,
         logger=logger,
         symbol_fetcher=_fetch_symbol_candles,
     )
+    return result.rows, result.errors
 
 
 async def _fetch_open_interest_tasks_parallel(
@@ -240,29 +246,31 @@ async def _fetch_open_interest_tasks_parallel(
     """Fetch open-interest tasks concurrently with bounded parallelism."""
 
     service_tasks = [
-        OpenInterestFetchTask(exchange=exchange, symbol=symbol, timeframe=timeframe)
+        OpenInterestFetchTaskDTO(exchange=exchange, symbol=symbol, timeframe=timeframe)
         for exchange, symbol, timeframe in oi_tasks
     ]
-    return await fetch_open_interest_tasks_parallel(
+    result = await fetch_open_interest_tasks_parallel(
         tasks=service_tasks,
         lake_root=lake_root,
         concurrency=concurrency,
         logger=logger,
         symbol_fetcher=_fetch_symbol_open_interest,
     )
+    return result.rows, result.errors
 
 
 def _write_loader_samples(
     candles_for_storage: dict[Market, dict[str, dict[str, list[SpotCandle]]]],
     open_interest_for_storage: dict[Market, dict[str, dict[str, list[OpenInterestPoint]]]],
     logger: logging.Logger,
+    generate_plots: bool = True,
 ) -> None:
     """Write per exchange/symbol/timeframe samples and matching full-data plots."""
 
-    write_loader_samples(
-        candles_for_storage=candles_for_storage,
-        open_interest_for_storage=open_interest_for_storage,
+    write_loader_samples_dto(
+        storage=LoaderStorageDTO(candles=candles_for_storage, open_interest=open_interest_for_storage),
         logger=logger,
+        options=ArtifactOptionsDTO(generate_plots=generate_plots),
     )
 
 
@@ -306,7 +314,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Optional list of timeframes. When set, fetch runs for each timeframe sequentially.",
     )
     spot_parser.add_argument("--plot", action="store_true", help="Create and save price/volume plots")
-    spot_parser.add_argument("--plot-dir", default="plots", help="Output directory for generated plots")
+    spot_parser.add_argument(
+        "--plot-dir",
+        default="samples",
+        help="Deprecated: plots are always written under samples/; this option is kept for compatibility.",
+    )
     spot_parser.add_argument(
         "--plot-price",
         choices=["spot", "close", "open", "high", "low"],
@@ -399,6 +411,9 @@ def build_parser() -> argparse.ArgumentParser:
 
 def _run_loader(args: argparse.Namespace, logger: logging.Logger) -> None:
     """Run loader command."""
+
+    if bool(args.plot) and cast(str, args.plot_dir) != "samples":
+        logger.info("Ignoring --plot-dir=%s; plots are always written under samples/", args.plot_dir)
 
     try:
         with SingleInstanceLock(".run/crypto-l2-loader.lock"):
@@ -533,76 +548,78 @@ def _run_loader(args: argparse.Namespace, logger: logging.Logger) -> None:
 
             if args.save_parquet_lake:
                 try:
-                    storage_output = persist_loader_outputs(
-                        candles_for_storage=candles_for_storage,
-                        open_interest_for_storage=open_interest_for_storage,
-                        save_parquet_lake=True,
-                        save_timescaledb=False,
-                        lake_root=cast(str, args.lake_root),
-                        timescaledb_schema=cast(str, args.timescaledb_schema),
-                        create_schema=not bool(args.timescaledb_no_bootstrap),
-                        oi_requested=oi_requested,
+                    storage_result = persist_loader_outputs_dto(
+                        storage=LoaderStorageDTO(
+                            candles=candles_for_storage,
+                            open_interest=open_interest_for_storage,
+                        ),
+                        options=PersistOptionsDTO(
+                            save_parquet_lake=True,
+                            save_timescaledb=False,
+                            lake_root=cast(str, args.lake_root),
+                            timescaledb_schema=cast(str, args.timescaledb_schema),
+                            create_schema=not bool(args.timescaledb_no_bootstrap),
+                            oi_requested=oi_requested,
+                        ),
                         save_tsdb_fn=save_market_data_to_timescaledb,
                     )
-                    output.update(storage_output)
+                    output.update(storage_result.to_output_dict())
                 except Exception as exc:  # noqa: BLE001
                     output["_parquet_error"] = str(exc)
                     logger.exception("Parquet lake write failed")
 
             if args.save_timescaledb:
                 try:
-                    storage_output = persist_loader_outputs(
-                        candles_for_storage=candles_for_storage,
-                        open_interest_for_storage=open_interest_for_storage,
-                        save_parquet_lake=False,
-                        save_timescaledb=True,
-                        lake_root=cast(str, args.lake_root),
-                        timescaledb_schema=cast(str, args.timescaledb_schema),
-                        create_schema=not bool(args.timescaledb_no_bootstrap),
-                        oi_requested=oi_requested,
+                    storage_result = persist_loader_outputs_dto(
+                        storage=LoaderStorageDTO(
+                            candles=candles_for_storage,
+                            open_interest=open_interest_for_storage,
+                        ),
+                        options=PersistOptionsDTO(
+                            save_parquet_lake=False,
+                            save_timescaledb=True,
+                            lake_root=cast(str, args.lake_root),
+                            timescaledb_schema=cast(str, args.timescaledb_schema),
+                            create_schema=not bool(args.timescaledb_no_bootstrap),
+                            oi_requested=oi_requested,
+                        ),
                         save_tsdb_fn=save_market_data_to_timescaledb,
                     )
-                    output.update(storage_output)
+                    output.update(storage_result.to_output_dict())
                 except Exception as exc:  # noqa: BLE001
                     output["_timescaledb_error"] = str(exc)
                     logger.exception("TimescaleDB write failed")
 
-            try:
-                _write_loader_samples(
-                    candles_for_storage=candles_for_storage,
-                    open_interest_for_storage=open_interest_for_storage,
-                    logger=logger,
-                )
-            except Exception:  # noqa: BLE001
-                logger.exception("Failed to generate loader samples")
+            artifact_candles: dict[Market, dict[str, dict[str, list[SpotCandle]]]] = {}
+            artifact_oi: dict[Market, dict[str, dict[str, list[OpenInterestPoint]]]] = {}
+            for exchange, market, symbol, timeframe in tasks:
+                symbol_key = symbol.upper()
+                if multi_market and multi_timeframe:
+                    plot_key = f"{market}_{symbol_key}__{timeframe}"
+                elif multi_market:
+                    plot_key = f"{market}_{symbol_key}"
+                elif multi_timeframe:
+                    plot_key = f"{symbol_key}__{timeframe}"
+                else:
+                    plot_key = symbol_key
 
-            if args.plot:
-                if not ohlcv_markets:
-                    output["_plot_info"] = "No OHLCV dataset selected; skipping plot generation."
-                    if not args.no_json_output:
-                        print(json.dumps(output, indent=2))
-                    logger.info("Command complete: loader")
-                    return
-                plot_source: dict[str, dict[str, list[SpotCandle]]] = {}
-                for exchange, market, symbol, timeframe in tasks:
-                    symbol_key = symbol.upper()
-                    if multi_market and multi_timeframe:
-                        plot_key = f"{market}_{symbol_key}__{timeframe}"
-                    elif multi_market:
-                        plot_key = f"{market}_{symbol_key}"
-                    elif multi_timeframe:
-                        plot_key = f"{symbol_key}__{timeframe}"
-                    else:
-                        plot_key = symbol_key
-                    result_key = (exchange, market, symbol, timeframe)
-                    fetched = task_results.get(result_key, [])
-                    merged_by_open_time = {item.open_time: item for item in fetched}
-                    try:
-                        storage_symbol = normalize_storage_symbol(
-                            exchange=exchange,
-                            symbol=symbol,
-                            market=market,
-                        )
+                result_key = (exchange, market, symbol, timeframe)
+                fetched = task_results.get(result_key, [])
+                merged_by_open_time = {item.open_time: item for item in fetched}
+                try:
+                    storage_symbol = normalize_storage_symbol(
+                        exchange=exchange,
+                        symbol=symbol,
+                        market=market,
+                    )
+                    stored_times = open_times_in_lake(
+                        lake_root=args.lake_root,
+                        market=market,
+                        exchange=exchange,
+                        symbol=storage_symbol,
+                        timeframe=timeframe,
+                    )
+                    if stored_times:
                         lake_candles = load_spot_candles_from_lake(
                             lake_root=args.lake_root,
                             market=market,
@@ -610,29 +627,74 @@ def _run_loader(args: argparse.Namespace, logger: logging.Logger) -> None:
                             symbol=storage_symbol,
                             timeframe=timeframe,
                         )
-                        for item in lake_candles:
-                            merged_by_open_time[item.open_time] = item
+                        for candle_row in lake_candles:
+                            merged_by_open_time[candle_row.open_time] = candle_row
+                except Exception:  # noqa: BLE001
+                    logger.exception(
+                        "Failed to load full-history OHLCV source exchange=%s symbol=%s timeframe=%s",
+                        exchange,
+                        symbol,
+                        timeframe,
+                    )
+                merged = [merged_by_open_time[key] for key in sorted(merged_by_open_time)]
+                artifact_candles.setdefault(market, {}).setdefault(exchange, {})[plot_key] = merged
+
+            if oi_requested:
+                for exchange, symbol, timeframe in oi_tasks:
+                    symbol_key = symbol.upper()
+                    if multi_timeframe:
+                        oi_plot_key = f"{symbol_key}__{timeframe}"
+                    else:
+                        oi_plot_key = symbol_key
+                    oi_key = (exchange, symbol, timeframe)
+                    fetched_oi = oi_results.get(oi_key, [])
+                    merged_oi_by_open_time: dict[datetime, OpenInterestPoint] = {
+                        oi_row.open_time: oi_row for oi_row in fetched_oi
+                    }
+                    try:
+                        storage_symbol = normalize_storage_symbol(
+                            exchange=exchange,
+                            symbol=symbol,
+                            market="perp",
+                        )
+                        normalized_oi_timeframe = normalize_open_interest_timeframe(exchange=exchange, value=timeframe)
+                        stored_oi_times = open_times_in_lake_by_dataset(
+                            lake_root=args.lake_root,
+                            dataset_type="open_interest",
+                            market="perp",
+                            exchange=exchange,
+                            symbol=storage_symbol,
+                            timeframe=normalized_oi_timeframe,
+                        )
+                        if stored_oi_times:
+                            lake_oi = load_open_interest_from_lake(
+                                lake_root=args.lake_root,
+                                market="perp",
+                                exchange=exchange,
+                                symbol=storage_symbol,
+                                timeframe=normalized_oi_timeframe,
+                            )
+                            for oi_row in lake_oi:
+                                merged_oi_by_open_time[oi_row.open_time] = oi_row
                     except Exception:  # noqa: BLE001
                         logger.exception(
-                            "Failed to load full-history plot source exchange=%s symbol=%s timeframe=%s",
+                            "Failed to load full-history OI source exchange=%s symbol=%s timeframe=%s",
                             exchange,
                             symbol,
                             timeframe,
                         )
+                    merged_oi = [merged_oi_by_open_time[key] for key in sorted(merged_oi_by_open_time)]
+                    artifact_oi.setdefault("perp", {}).setdefault(exchange, {})[oi_plot_key] = merged_oi
 
-                    exchange_plots = plot_source.setdefault(exchange, {})
-                    exchange_plots[plot_key] = [merged_by_open_time[key] for key in sorted(merged_by_open_time)]
-
-                try:
-                    saved_paths = save_candle_plots(
-                        candles_by_exchange=plot_source,
-                        output_dir=args.plot_dir,
-                        price_field=cast(PriceField, args.plot_price),
-                    )
-                    output["_plots"] = saved_paths
-                except Exception as exc:  # noqa: BLE001
-                    output["_plot_error"] = str(exc)
-                    logger.exception("Plot generation failed")
+            try:
+                _write_loader_samples(
+                    candles_for_storage=artifact_candles,
+                    open_interest_for_storage=artifact_oi,
+                    logger=logger,
+                    generate_plots=bool(args.plot),
+                )
+            except Exception:  # noqa: BLE001
+                logger.exception("Failed to generate loader samples")
 
             if not args.no_json_output:
                 print(json.dumps(output, indent=2))

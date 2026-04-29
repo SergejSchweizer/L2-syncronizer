@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 from datetime import UTC
+from typing import Literal
 
 import pytest
-from typing import Literal
 
 from ingestion.exchanges import deribit
 from ingestion.spot import (

@@ -43,7 +43,7 @@ def test_fetch_candle_tasks_parallel_splits_success_and_errors() -> None:
             raise RuntimeError("boom")
         return [candle]
 
-    results, errors = asyncio.run(
+    result = asyncio.run(
         fetch_candle_tasks_parallel(
             tasks=[task_ok, task_fail],
             lake_root="lake/bronze",
@@ -53,8 +53,8 @@ def test_fetch_candle_tasks_parallel_splits_success_and_errors() -> None:
         )
     )
 
-    assert (task_ok.exchange, task_ok.market, task_ok.symbol, task_ok.timeframe) in results
-    assert (task_fail.exchange, task_fail.market, task_fail.symbol, task_fail.timeframe) in errors
+    assert (task_ok.exchange, task_ok.market, task_ok.symbol, task_ok.timeframe) in result.rows
+    assert (task_fail.exchange, task_fail.market, task_fail.symbol, task_fail.timeframe) in result.errors
 
 
 def test_fetch_open_interest_tasks_parallel_splits_success_and_errors() -> None:
@@ -79,7 +79,7 @@ def test_fetch_open_interest_tasks_parallel_splits_success_and_errors() -> None:
             raise RuntimeError("boom")
         return [point]
 
-    results, errors = asyncio.run(
+    result = asyncio.run(
         fetch_open_interest_tasks_parallel(
             tasks=[task_ok, task_fail],
             lake_root="lake/bronze",
@@ -89,5 +89,5 @@ def test_fetch_open_interest_tasks_parallel_splits_success_and_errors() -> None:
         )
     )
 
-    assert (task_ok.exchange, task_ok.symbol, task_ok.timeframe) in results
-    assert (task_fail.exchange, task_fail.symbol, task_fail.timeframe) in errors
+    assert (task_ok.exchange, task_ok.symbol, task_ok.timeframe) in result.rows
+    assert (task_fail.exchange, task_fail.symbol, task_fail.timeframe) in result.errors

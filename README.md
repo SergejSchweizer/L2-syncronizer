@@ -8,6 +8,9 @@ Current implemented scope (Step 1):
 - Pull BTC/ETH candles from Deribit public APIs for spot/perp markets.
 - Expose a CLI command for repeatable loader runs.
 
+Scope note:
+- The repository name keeps the long-term direction (`crypto-l2-loader`), while the current production implementation is Deribit-only OHLCV + OI ingestion. L2 order book ingestion is planned future scope.
+
 ## 2. Architecture Diagram
 
 ```text
@@ -42,7 +45,6 @@ Core dependencies are managed through `pyproject.toml` and include:
 
 - `ingestion/http_client.py`: lightweight JSON HTTP utilities.
 - `ingestion/spot.py`: exchange-agnostic candle load/normalization interface.
-- `ingestion/exchanges/deribit.py`: Deribit adapter with symbol and timeframe mapping.
 - `ingestion/exchanges/deribit.py`: Deribit adapter with symbol and timeframe mapping.
 - `ingestion/plotting.py`: chart rendering for loaded price and volume data.
 - `ingestion/lake.py`: parquet lake writer for partitioned candle datasets.
@@ -128,9 +130,7 @@ Loaded candle variables (`SpotCandle`):
   - `quote_volume = float(row[7])` when provided by endpoint.
   - `trade_count = int(row[8])` when provided by endpoint, else `0` on adapters without trade-count payloads.
 - Exchange-specific details:
-  - Binance spot: direct kline mapping (`/api/v3/klines`).
   - Deribit spot: built from `ticks/open/high/low/close/volume`; `close_time = open_time + timeframe_ms - 1`, `quote_volume = volume` fallback, `trade_count = 0`.
-  - Bybit spot: `close_time = open_time + timeframe_ms - 1`, `quote_volume = turnover`, `trade_count = 0`.
 
 #### `perp` dataset (`dataset_type=ohlcv`, `instrument_type=perp`)
 - Meaning:
@@ -140,9 +140,7 @@ Loaded candle variables (`SpotCandle`):
 - Computation in pipeline:
   Uses the same `SpotCandle` parser and same storage row builder (`candle_record`) as `spot`, preserving identical field semantics.
 - Exchange-specific details:
-  - Binance perp: futures kline endpoint (`/fapi/v1/klines`) with direct index mapping.
   - Deribit perp: TradingView chart endpoint with computed `close_time` and fallback fields identical to Deribit spot behavior.
-  - Bybit perp: v5 kline endpoint with `category=linear`, `quote_volume=turnover`, `trade_count=0`.
 
 #### `oi` dataset (`dataset_type=open_interest`, `instrument_type=perp`)
 - Meaning:
@@ -157,12 +155,6 @@ Loaded candle variables (`SpotCandle`):
   - `open_interest` comes from exchange OI quantity field.
   - `open_interest_value` is used when exchange provides notional/value OI, otherwise set to `0.0`.
 - Exchange-specific OI mapping:
-  - Binance (`/futures/data/openInterestHist`):
-    - `open_interest = float(sumOpenInterest)`.
-    - `open_interest_value = float(sumOpenInterestValue)` (fallback `0.0` if absent).
-  - Bybit (`/v5/market/open-interest`, `category=linear`):
-    - `open_interest = float(openInterest)`.
-    - `open_interest_value = 0.0` (not provided by current endpoint response mapping).
   - Deribit (`/api/v2/public/get_last_settlements_by_instrument`):
     - Raw settlement `timestamp` is bucketed to requested timeframe:
       `bucket_open_ms = floor(timestamp / timeframe_ms) * timeframe_ms`.
@@ -200,24 +192,10 @@ Exchange coverage:
 |---|---|---|---|
 | Deribit | Yes | Yes | Spot maps to instruments like `BTC_USDC`; perp maps to `BTC-PERPETUAL`. |
 
-### 5.3 Perpetual Field Mapping (Origin -> Storage)
+### 5.3 Perpetual Field Mapping (Deribit Origin -> Storage)
 
 Perpetual rows are normalized into the same storage schema as spot:
 `open_time`, `close_time`, `open`, `high`, `low`, `close`, `volume`, `quote_volume`, `trade_count`, plus metadata.
-
-Binance perp (`/fapi/v1/klines`) mapping:
-
-| Origin Field | Storage Field |
-|---|---|
-| `row[0]` (open time ms) | `open_time` |
-| `row[6]` (close time ms) | `close_time` |
-| `row[1]` | `open` |
-| `row[2]` | `high` |
-| `row[3]` | `low` |
-| `row[4]` | `close` |
-| `row[5]` | `volume` |
-| `row[7]` | `quote_volume` |
-| `row[8]` | `trade_count` |
 
 Deribit perp (`/api/v2/public/get_tradingview_chart_data`) mapping:
 
@@ -233,32 +211,16 @@ Deribit perp (`/api/v2/public/get_tradingview_chart_data`) mapping:
 | `result.volume[i]` (fallback proxy) | `quote_volume` |
 | not provided by endpoint | `trade_count = 0` |
 
-Bybit perp (`/v5/market/kline`, `category=linear`) mapping:
-
-| Origin Field | Storage Field |
-|---|---|
-| `list[i][0]` (start time ms) | `open_time` |
-| `open_time + interval_ms - 1` | `close_time` |
-| `list[i][1]` | `open` |
-| `list[i][2]` | `high` |
-| `list[i][3]` | `low` |
-| `list[i][4]` | `close` |
-| `list[i][5]` | `volume` |
-| `list[i][6]` (turnover) | `quote_volume` |
-| not provided by endpoint | `trade_count = 0` |
-
 ### 5.4 Perpetual Symbol Naming by Exchange
 
-Perpetual symbol normalization is exchange-specific. The loader accepts aliases and maps them to canonical storage symbols.
+Perpetual symbol normalization (Deribit):
 
 | Exchange | Canonical Perp Symbols | Accepted Input Aliases | Normalized Output |
 |---|---|---|---|
-| Binance | `BTCUSDT`, `ETHUSDT` | `BTC`, `BTCUSD`, `BTCUSDT`; `ETH`, `ETHUSD`, `ETHUSDT` | `BTCUSDT`, `ETHUSDT` |
 | Deribit | `BTC-PERPETUAL`, `ETH-PERPETUAL` | `BTC`, `BTCUSDT`, `BTCUSD`, `BTC-PERPETUAL`; `ETH`, `ETHUSDT`, `ETHUSD`, `ETH-PERPETUAL` | `BTC-PERPETUAL`, `ETH-PERPETUAL` |
-| Bybit | `BTCUSDT`, `ETHUSDT` | `BTC`, `BTCUSD`, `BTCUSDT`; `ETH`, `ETHUSD`, `ETHUSDT` | `BTCUSDT`, `ETHUSDT` |
 
-Portable CLI recommendation:
-- Use `BTC` / `ETH` for cross-exchange commands on both `spot` and `perp`; adapters normalize to exchange-specific canonical symbols.
+CLI recommendation:
+- Use `BTC` / `ETH`; Deribit adapters normalize to canonical Deribit symbols.
 
 ## 6. Execution Workflow
 
@@ -286,10 +248,10 @@ Load multiple timeframes in one run:
 python3 main.py loader --exchange deribit --market spot --symbols BTC ETH --timeframes M1 M5 H1 --no-json-output
 ```
 
-Load and generate plots (price + volume) under `plots/`:
+Load and generate plots (price + volume) under `samples/`:
 
 ```bash
-python3 main.py loader --exchange deribit --market spot --symbols BTC ETH --timeframe M5 --plot --plot-dir plots --plot-price close
+python3 main.py loader --exchange deribit --market spot --symbols BTC ETH --timeframe M5 --plot --plot-price close
 ```
 
 Save loaded data to parquet lake format:
@@ -377,7 +339,7 @@ Export deterministic descriptive statistics for reporting:
 python3 main.py export-descriptive-stats --lake-root lake/bronze --output-csv docs/tables/descriptive_stats_baseline.csv --start-time 2026-01-01T00:00:00+00:00 --end-time 2026-01-31T23:59:59+00:00
 ```
 
-Load Binance + Deribit perpetual candles (portable perp inputs):
+Load Deribit perpetual candles (portable perp inputs):
 
 ```bash
 python3 main.py loader --exchange deribit --market perp --symbols BTC ETH --timeframe M5
@@ -387,7 +349,6 @@ List all currently supported spot timeframes:
 
 ```bash
 python3 main.py list-spot-timeframes
-python3 main.py list-spot-timeframes --exchange deribit
 python3 main.py list-spot-timeframes --exchange deribit
 ```
 
