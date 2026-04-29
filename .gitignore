@@ -18,6 +18,8 @@
 # Source and test trees.
 !api/
 !api/**
+!application/
+!application/**
 !ingestion/
 !ingestion/**
 !preprocessing/
