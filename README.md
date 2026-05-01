@@ -178,15 +178,73 @@ lake/bronze/
 | `open_interest` | Deribit open interest value included in the order book response. |
 | `funding_8h`, `current_funding` | Deribit funding fields included in the order book response. |
 
-`L2MinuteBar` includes:
+`L2MinuteBar` captures one generated 1-minute aggregation row per exchange, symbol, and minute. Only valid snapshots with a non-empty, non-crossed best book are included; crossed books, empty books, and non-positive best prices are dropped before aggregation.
 
-- Mid-price OHLC from valid non-crossed snapshots.
-- Mean, max, and last spread in basis points.
-- Depth means at 1, 10, and 50 levels.
-- Book imbalance at 1, 10, and 50 levels.
-- L1 microprice and side VWAP features.
-- Last mark, index, open-interest, and funding fields.
-- Mean, max, and last fetch duration.
+Snapshot-level formulas used by the 1m aggregator:
+
+| Formula | Meaning |
+|---|---|
+| `mid = (best_bid + best_ask) / 2` | Best bid/ask midpoint. |
+| `spread_bps = ((best_ask - best_bid) / mid) * 10000` | Quoted spread in basis points. |
+| `bid_depth_N`, `ask_depth_N` | Sum of side amounts through the first `N` book levels. |
+| `imbalance_N = (bid_depth_N - ask_depth_N) / (bid_depth_N + ask_depth_N)` | Signed depth imbalance. Positive values indicate more bid depth; negative values indicate more ask depth. `None` when both sides have zero depth. |
+| `microprice = ((best_ask * bid_amount_1) + (best_bid * ask_amount_1)) / (bid_amount_1 + ask_amount_1)` | L1 queue-weighted price. `None` when total L1 amount is zero. |
+| `microprice_minus_mid = microprice - mid` | L1 microprice displacement from midpoint. |
+| `side_vwap_10 = sum(price * amount) / sum(amount)` | Side-specific VWAP through the first 10 book levels. `None` when the side has zero depth. |
+
+Generated 1m aggregation fields:
+
+| Field | Meaning |
+|---|---|
+| `minute_ts` | UTC minute bucket start. Snapshots are grouped by `timestamp` truncated to the minute. |
+| `exchange` | Source exchange name. Currently `deribit`. |
+| `symbol` | Normalized exchange instrument symbol, for example `BTC-PERPETUAL`. |
+| `snapshot_count` | Number of valid snapshots included in the minute row. |
+| `mid_open` | First snapshot midpoint in timestamp order within the minute. |
+| `mid_high` | Maximum snapshot midpoint within the minute. |
+| `mid_low` | Minimum snapshot midpoint within the minute. |
+| `mid_close` | Last snapshot midpoint in timestamp order within the minute. |
+| `mark_close` | Mark price from the last included snapshot, when Deribit provides it. |
+| `index_close` | Index price from the last included snapshot, when Deribit provides it. |
+| `spread_bps_mean` | Arithmetic mean of snapshot `spread_bps` values within the minute. |
+| `spread_bps_max` | Maximum snapshot `spread_bps` within the minute. |
+| `spread_bps_last` | Last snapshot `spread_bps` in timestamp order within the minute. |
+| `bid_depth_1_mean` | Mean bid amount at the best bid level. |
+| `ask_depth_1_mean` | Mean ask amount at the best ask level. |
+| `bid_depth_10_mean` | Mean cumulative bid amount through the first 10 bid levels. |
+| `ask_depth_10_mean` | Mean cumulative ask amount through the first 10 ask levels. |
+| `bid_depth_50_mean` | Mean cumulative bid amount through the first 50 bid levels. If fewer levels are present, all available levels are summed. |
+| `ask_depth_50_mean` | Mean cumulative ask amount through the first 50 ask levels. If fewer levels are present, all available levels are summed. |
+| `imbalance_1_mean` | Mean L1 depth imbalance across snapshots with a defined L1 imbalance. |
+| `imbalance_10_mean` | Mean 10-level depth imbalance across snapshots with a defined 10-level imbalance. |
+| `imbalance_50_mean` | Mean 50-level depth imbalance across snapshots with a defined 50-level imbalance. |
+| `imbalance_10_last` | Last 10-level depth imbalance in timestamp order within the minute. |
+| `imbalance_50_last` | Last 50-level depth imbalance in timestamp order within the minute. |
+| `microprice_close` | Last L1 microprice in timestamp order within the minute. |
+| `microprice_minus_mid_mean` | Mean L1 microprice displacement from midpoint across snapshots with a defined microprice. |
+| `bid_vwap_10_mean` | Mean bid-side VWAP through the first 10 bid levels across snapshots with defined bid VWAP. |
+| `ask_vwap_10_mean` | Mean ask-side VWAP through the first 10 ask levels across snapshots with defined ask VWAP. |
+| `open_interest_last` | Open interest from the last included snapshot, when Deribit provides it. |
+| `funding_8h_last` | 8-hour funding field from the last included snapshot, when Deribit provides it. |
+| `current_funding_last` | Current funding field from the last included snapshot, when Deribit provides it. |
+| `fetch_duration_s_mean` | Mean wall-clock fetch duration for included snapshots, in seconds. |
+| `fetch_duration_s_max` | Maximum wall-clock fetch duration for included snapshots, in seconds. |
+| `fetch_duration_s_last` | Last included snapshot fetch duration, in seconds. |
+
+Parquet rows are produced from `L2MinuteBar` with additional lake metadata:
+
+| Field | Meaning |
+|---|---|
+| `schema_version` | Parquet row schema version. Currently `v1`. |
+| `dataset_type` | Dataset identifier. Currently `l2_m1`. |
+| `instrument_type` | Instrument category. Currently `perp`. |
+| `event_time` | Same timestamp as `minute_ts`; the canonical event time for the row. |
+| `ingested_at` | UTC timestamp when the row was prepared for lake persistence. |
+| `run_id` | Unique CLI run identifier assigned during ingestion. |
+| `source_endpoint` | Logical source endpoint name. Currently `public_l2_orderbook`. |
+| `open_time` | Inclusive 1m interval start, equal to `minute_ts`. |
+| `close_time` | 1m interval close marker, set to `minute_ts` plus `59.999` seconds. |
+| `timeframe` | Aggregation timeframe. Currently `1m`. |
 
 ## Testing
 
