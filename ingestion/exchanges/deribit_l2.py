@@ -73,9 +73,15 @@ def _normalize_level(level: object) -> tuple[float, float]:
 def normalize_l2_symbol(symbol: str) -> str:
     """Normalize a Deribit perpetual symbol alias to an instrument name."""
 
-    value = symbol.strip().upper().replace("/", "").replace("_", "-")
+    value = symbol.strip().upper().replace("/", "")
     if not value:
         raise ValueError("symbol must not be empty")
+    if value in {"SOL", "SOLUSDC", "SOL-USDC", "SOL_USDC"}:
+        return "SOL_USDC-PERPETUAL"
+    if value == "SOLUSDC-PERPETUAL" or value == "SOL-USDC-PERPETUAL":
+        return "SOL_USDC-PERPETUAL"
+    if value == "SOL_USDC-PERPETUAL":
+        return value
     if value.endswith("-PERPETUAL"):
         return value
     if value.endswith("PERPETUAL") and "-" not in value:

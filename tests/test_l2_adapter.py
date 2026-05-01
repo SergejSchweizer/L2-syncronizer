@@ -43,7 +43,10 @@ def test_fetch_order_book_snapshot_normalizes_payload(monkeypatch: pytest.Monkey
         ("btcusdt", "BTC-PERPETUAL"),
         ("BTCUSD", "BTC-PERPETUAL"),
         ("BTC-PERPETUAL", "BTC-PERPETUAL"),
-        ("BTC_PERPETUAL", "BTC-PERPETUAL"),
+        ("SOL", "SOL_USDC-PERPETUAL"),
+        ("SOLUSDC", "SOL_USDC-PERPETUAL"),
+        ("SOL_USDC-PERPETUAL", "SOL_USDC-PERPETUAL"),
+        ("SOL-USDC-PERPETUAL", "SOL_USDC-PERPETUAL"),
     ],
 )
 def test_normalize_l2_symbol_accepts_common_aliases(raw_symbol: str, expected: str) -> None:

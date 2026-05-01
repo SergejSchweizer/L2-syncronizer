@@ -21,6 +21,7 @@ from api.runtime import (
     fetch_concurrency,
     load_env_file,
 )
+from ingestion.exchanges.deribit_l2 import fetch_order_book_snapshot, normalize_l2_symbol
 from ingestion.l2 import L2MinuteBar, L2Snapshot, aggregate_snapshots_to_m1, fetch_l2_snapshots_for_symbols
 from ingestion.lake import save_l2_m1_parquet_lake
 
@@ -95,6 +96,31 @@ def build_parser() -> argparse.ArgumentParser:
         "--json-output",
         action=argparse.BooleanOptionalAction,
         default=not env_bool("L2_INGEST_NO_JSON_OUTPUT", False),
+        help="Print JSON output",
+    )
+
+    validate_parser = subparsers.add_parser(
+        "validate-symbols",
+        help="Resolve symbols and check whether Deribit returns a usable L2 book",
+    )
+    validate_parser.add_argument("--exchange", choices=["deribit"], default=env_str("L2_INGEST_EXCHANGE", "deribit"))
+    validate_parser.add_argument(
+        "--symbols",
+        nargs="+",
+        default=env_list("L2_INGEST_SYMBOLS", ["BTC", "ETH"]),
+        type=str,
+        help="Symbols to validate, separated by spaces or commas",
+    )
+    validate_parser.add_argument(
+        "--levels",
+        type=int,
+        default=1,
+        help="Number of book levels per side to request for validation",
+    )
+    validate_parser.add_argument(
+        "--json-output",
+        action=argparse.BooleanOptionalAction,
+        default=True,
         help="Print JSON output",
     )
 
@@ -340,6 +366,34 @@ def _persist_l2_rows(
         return [], parquet_error
 
 
+def _estimated_poll_runtime_s(snapshot_count: int, poll_interval_s: float) -> float:
+    """Estimate runtime spent sleeping between polling ticks."""
+
+    return max(0, snapshot_count - 1) * poll_interval_s
+
+
+def _warn_for_long_poll_schedule(
+    logger: logging.Logger,
+    snapshot_count: int,
+    poll_interval_s: float,
+    max_runtime_s: float,
+) -> None:
+    """Warn when polling settings are likely to collide with minute cron runs."""
+
+    estimated_s = _estimated_poll_runtime_s(snapshot_count=snapshot_count, poll_interval_s=poll_interval_s)
+    if max_runtime_s > 0 and estimated_s >= max_runtime_s:
+        logger.warning(
+            "L2 polling sleep budget may exceed max runtime estimated_sleep_s=%.3f max_runtime_s=%.3f",
+            estimated_s,
+            max_runtime_s,
+        )
+    if estimated_s >= 60:
+        logger.warning(
+            "L2 polling sleep budget is at least one minute estimated_sleep_s=%.3f; cron runs may overlap",
+            estimated_s,
+        )
+
+
 def _run_loader_l2_m1(args: argparse.Namespace, logger: logging.Logger) -> None:
     """Run L2 snapshot collection and M1 aggregation."""
 
@@ -350,6 +404,12 @@ def _run_loader_l2_m1(args: argparse.Namespace, logger: logging.Logger) -> None:
             symbols = _normalize_cli_symbols(cast(list[str], args.symbols))
             requested_snapshots = int(args.snapshot_count)
             max_runtime_s = float(args.max_runtime_s)
+            _warn_for_long_poll_schedule(
+                logger=logger,
+                snapshot_count=requested_snapshots,
+                poll_interval_s=float(args.poll_interval_s),
+                max_runtime_s=max_runtime_s,
+            )
             snapshots_by_symbol = fetch_l2_snapshots_for_symbols(
                 exchange=exchange,
                 symbols=symbols,
@@ -393,6 +453,66 @@ def _run_loader_l2_m1(args: argparse.Namespace, logger: logging.Logger) -> None:
         raise SystemExit(str(exc)) from exc
 
 
+def _validate_symbol(symbol: str, depth: int) -> dict[str, object]:
+    """Validate one Deribit L2 symbol by fetching a shallow order book."""
+
+    normalized_symbol = normalize_l2_symbol(symbol)
+    try:
+        snapshot = fetch_order_book_snapshot(symbol=symbol, depth=depth)
+        bids = snapshot["bids"]
+        asks = snapshot["asks"]
+        valid_book = (
+            isinstance(bids, list)
+            and isinstance(asks, list)
+            and bool(bids)
+            and bool(asks)
+            and bids[0][0] > 0
+            and asks[0][0] > 0
+            and bids[0][0] < asks[0][0]
+        )
+        return {
+            "symbol": symbol,
+            "normalized_symbol": snapshot["symbol"],
+            "valid_book": valid_book,
+            "bid_levels": len(bids) if isinstance(bids, list) else 0,
+            "ask_levels": len(asks) if isinstance(asks, list) else 0,
+            "error": None,
+        }
+    except Exception as exc:  # noqa: BLE001
+        return {
+            "symbol": symbol,
+            "normalized_symbol": normalized_symbol,
+            "valid_book": False,
+            "bid_levels": 0,
+            "ask_levels": 0,
+            "error": str(exc),
+        }
+
+
+def _run_validate_symbols(args: argparse.Namespace, logger: logging.Logger) -> None:
+    """Run symbol alias and order book validation."""
+
+    symbols = _normalize_cli_symbols(cast(list[str], args.symbols))
+    depth = int(args.levels)
+    if depth <= 0:
+        raise ValueError("levels must be positive")
+
+    results = [_validate_symbol(symbol=symbol, depth=depth) for symbol in symbols]
+    output = {
+        "exchange": cast(str, args.exchange),
+        "symbols": results,
+        "all_valid": all(bool(item["valid_book"]) for item in results),
+    }
+    if bool(args.json_output):
+        print(json.dumps(output, indent=2))
+    logger.info(
+        "Symbol validation complete exchange=%s symbols=%s all_valid=%s",
+        args.exchange,
+        ",".join(symbols),
+        output["all_valid"],
+    )
+
+
 def main() -> None:
     """CLI entrypoint."""
 
@@ -400,7 +520,10 @@ def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
     logger = configure_logging(module_name=str(args.command))
-    _run_loader_l2_m1(args=args, logger=logger)
+    if args.command == "loader-l2-m1":
+        _run_loader_l2_m1(args=args, logger=logger)
+    elif args.command == "validate-symbols":
+        _run_validate_symbols(args=args, logger=logger)
 
 
 if __name__ == "__main__":

@@ -11,6 +11,7 @@ Current scope is intentionally narrow:
 - Aggregate valid, non-crossed snapshots into M1 microstructure feature rows.
 - Optionally persist aggregated M1 rows to idempotent Parquet partitions.
 - Expose one CLI command: `loader-l2-m1`.
+- Validate symbol aliases before scheduled jobs with `validate-symbols`.
 
 Former OHLCV, standalone open-interest, standalone funding, plotting, research-report, and database-ingestion surfaces have been removed.
 
@@ -25,6 +26,11 @@ CLI
   -> M1 microstructure aggregation
   -> JSON run output and structured logs
   -> Optional Parquet lake writer
+
+CLI (validate-symbols)
+  -> Symbol alias normalization
+  -> Shallow Deribit order book fetch
+  -> Valid book report
 ```
 
 Current top-level code layout:
@@ -104,6 +110,7 @@ python main.py loader-l2-m1 [options]
 | `--json-output`, `--no-json-output` | Enable or suppress JSON output. Logs are still emitted. |
 
 Symbols are normalized to Deribit perpetual instruments. For example, `BTC`, `BTCUSDT`, `BTCUSD`, and `BTC-PERPETUAL` resolve to `BTC-PERPETUAL`.
+`SOL` resolves to Deribit's active `SOL_USDC-PERPETUAL` market.
 
 Fetch BTC and ETH snapshots, aggregate to M1 bars, and print JSON:
 
@@ -126,6 +133,12 @@ python main.py loader-l2-m1 \
   --snapshot-count 60 \
   --poll-interval-s 1 \
   --save-parquet-lake
+```
+
+Validate symbols before adding them to cron:
+
+```bash
+python main.py validate-symbols --symbols BTC ETH SOL
 ```
 
 The Parquet layout is:
