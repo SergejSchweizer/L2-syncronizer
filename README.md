@@ -244,9 +244,9 @@ Gold is M1-only. It does not forward-fill missing minutes. Each minute uses firs
 For each base asset symbol, Gold writes three artifacts with the same basename:
 
 ```text
-lake/gold/BTC_<jsonhash>_<gitcommithash>.parquet
-lake/gold/BTC_<jsonhash>_<gitcommithash>.json
-lake/gold/BTC_<jsonhash>_<gitcommithash>.png
+lake/gold/BTC_L2_<jsonhash>_<gitcommithash>.parquet
+lake/gold/BTC_L2_<jsonhash>_<gitcommithash>.json
+lake/gold/BTC_L2_<jsonhash>_<gitcommithash>.png
 ```
 
 The JSON metadata contains dataset-level and feature-level metadata, including hash string, UTC build timestamp, row/column stats, timestamp bounds, source Silver dataset summaries, and per-feature dtype/null/numeric distribution stats. It intentionally does not store filesystem paths.
@@ -294,15 +294,15 @@ The Gold artifact layout is flat by base asset and reproducibility suffix:
 
 ```text
 lake/gold/
-  BTC_<jsonhash>_<gitcommithash>.parquet
-  BTC_<jsonhash>_<gitcommithash>.json
-  BTC_<jsonhash>_<gitcommithash>.png
-  ETH_<jsonhash>_<gitcommithash>.parquet
-  ETH_<jsonhash>_<gitcommithash>.json
-  ETH_<jsonhash>_<gitcommithash>.png
-  SOL_<jsonhash>_<gitcommithash>.parquet
-  SOL_<jsonhash>_<gitcommithash>.json
-  SOL_<jsonhash>_<gitcommithash>.png
+  BTC_L2_<jsonhash>_<gitcommithash>.parquet
+  BTC_L2_<jsonhash>_<gitcommithash>.json
+  BTC_L2_<jsonhash>_<gitcommithash>.png
+  ETH_L2_<jsonhash>_<gitcommithash>.parquet
+  ETH_L2_<jsonhash>_<gitcommithash>.json
+  ETH_L2_<jsonhash>_<gitcommithash>.png
+  SOL_L2_<jsonhash>_<gitcommithash>.parquet
+  SOL_L2_<jsonhash>_<gitcommithash>.json
+  SOL_L2_<jsonhash>_<gitcommithash>.png
 ```
 
 ## Modules

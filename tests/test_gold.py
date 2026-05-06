@@ -109,7 +109,7 @@ def test_write_gold_l2_m1_artifacts_writes_parquet_json_and_png(tmp_path: Path) 
     basenames = {Path(file_path).stem for file_path in files}
     assert len(basenames) == 1
     basename = basenames.pop()
-    assert basename.startswith("BTC_")
+    assert basename.startswith("BTC_L2_")
     assert basename.endswith("_abcdef123456")
 
     metadata_path = next(Path(file_path) for file_path in files if file_path.endswith(".json"))

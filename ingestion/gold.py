@@ -212,7 +212,7 @@ def write_gold_l2_m1_artifacts(
             "gold_schema": {name: str(dtype) for name, dtype in symbol_frame.schema.items()},
         }
         hash_string = stable_json_hash(hash_payload)
-        basename = f"{base_symbol}_{hash_string}_{git_commit_hash[:12]}"
+        basename = f"{base_symbol}_L2_{hash_string}_{git_commit_hash[:12]}"
         parquet_path = output_root / f"{basename}.parquet"
         json_path = output_root / f"{basename}.json"
         png_path = output_root / f"{basename}.png"
