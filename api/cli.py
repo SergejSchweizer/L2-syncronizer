@@ -12,6 +12,8 @@ from typing import cast
 from api.constants import (
     BRONZE_BUILDER_COMMAND,
     BRONZE_BUILDER_LOCK_PATH,
+    GOLD_BUILDER_COMMAND,
+    GOLD_BUILDER_LOCK_PATH,
     SILVER_BUILDER_COMMAND,
     SILVER_BUILDER_LOCK_PATH,
     VALIDATE_SYMBOLS_COMMAND,
@@ -33,6 +35,7 @@ from ingestion.config import (
     load_config,
 )
 from ingestion.exchanges.deribit_l2 import fetch_order_book_snapshot, normalize_l2_symbol
+from ingestion.gold import transform_l2_silver_to_gold
 from ingestion.l2 import L2Snapshot, fetch_l2_snapshots_for_symbols
 from ingestion.lake import save_l2_snapshot_parquet_lake
 from ingestion.silver import transform_l2_bronze_to_silver
@@ -40,6 +43,20 @@ from ingestion.silver import transform_l2_bronze_to_silver
 __all__ = ["SingleInstanceError", "SingleInstanceLock", "build_parser", "main"]
 
 SnapshotsBySymbol = dict[str, list[L2Snapshot]]
+
+
+def _boolean_optional_flag(
+    parser: argparse.ArgumentParser,
+    name: str,
+    default: bool,
+    help_text: str,
+) -> None:
+    parser.add_argument(
+        f"--{name}",
+        action=argparse.BooleanOptionalAction,
+        default=default,
+        help=help_text,
+    )
 
 
 def build_parser(config: Config | None = None) -> argparse.ArgumentParser:
@@ -110,7 +127,7 @@ def build_parser(config: Config | None = None) -> argparse.ArgumentParser:
 
     silver_parser = subparsers.add_parser(
         SILVER_BUILDER_COMMAND,
-        help="Transform bronze L2 snapshots into monthly silver feature parquet partitions",
+        help="Transform bronze L2 snapshots into monthly silver feature artifacts",
     )
     silver_parser.add_argument(
         "--bronze-lake-root",
@@ -120,7 +137,7 @@ def build_parser(config: Config | None = None) -> argparse.ArgumentParser:
     silver_parser.add_argument(
         "--silver-lake-root",
         default=config_str(ingestion_config, "silver_lake_root", "lake/silver"),
-        help="Root directory for silver parquet output files",
+        help="Root directory for silver output artifact files",
     )
     silver_parser.add_argument(
         "--depth",
@@ -128,11 +145,68 @@ def build_parser(config: Config | None = None) -> argparse.ArgumentParser:
         default=config_int(ingestion_config, "levels", 50),
         help="Expected book depth used for fixed-width silver arrays",
     )
-    silver_parser.add_argument(
-        "--json-output",
-        action=argparse.BooleanOptionalAction,
-        default=config_bool(ingestion_config, "json_output", True),
-        help="Print JSON output",
+    _boolean_optional_flag(
+        silver_parser,
+        "plot",
+        True,
+        "Enable or suppress Silver PNG profile generation",
+    )
+    _boolean_optional_flag(
+        silver_parser,
+        "manifest",
+        True,
+        "Enable or suppress Silver JSON metadata manifest generation",
+    )
+    _boolean_optional_flag(
+        silver_parser,
+        "json-output",
+        config_bool(ingestion_config, "json_output", True),
+        "Print JSON output",
+    )
+
+    gold_parser = subparsers.add_parser(
+        GOLD_BUILDER_COMMAND,
+        help="Transform silver L2 features into per-symbol gold M1 artifacts",
+    )
+    gold_parser.add_argument(
+        "--silver-lake-root",
+        default=config_str(ingestion_config, "silver_lake_root", "lake/silver"),
+        help="Root directory for silver parquet input files",
+    )
+    gold_parser.add_argument(
+        "--gold-lake-root",
+        default=config_str(ingestion_config, "gold_lake_root", "lake/gold"),
+        help="Root directory for gold artifact output files",
+    )
+    gold_parser.add_argument(
+        "--expected-snapshots-per-minute",
+        type=int,
+        default=6,
+        help="Expected silver snapshots per minute for quality coverage",
+    )
+    gold_parser.add_argument(
+        "--completeness-threshold",
+        type=float,
+        default=0.8,
+        help="Minimum coverage ratio for a complete minute",
+    )
+    _boolean_optional_flag(
+        gold_parser,
+        "plot",
+        True,
+        "Enable or suppress Gold PNG profile generation",
+    )
+    _boolean_optional_flag(
+        gold_parser,
+        "manifest",
+        True,
+        "Enable or suppress Gold JSON metadata manifest generation",
+    )
+    _boolean_optional_flag(
+        gold_parser,
+        "json-output",
+        config_bool(ingestion_config, "json_output", True),
+        "Print JSON output",
     )
 
     validate_parser = subparsers.add_parser(
@@ -399,6 +473,8 @@ def _run_silver_builder(args: argparse.Namespace, logger: logging.Logger) -> Non
                 bronze_lake_root=bronze_lake_root,
                 silver_lake_root=silver_lake_root,
                 depth=depth,
+                plot=bool(args.plot),
+                manifest=bool(args.manifest),
             )
             elapsed_s = perf_counter() - started_at
             output = {
@@ -407,13 +483,13 @@ def _run_silver_builder(args: argparse.Namespace, logger: logging.Logger) -> Non
                 "bronze_lake_root": bronze_lake_root,
                 "silver_lake_root": silver_lake_root,
                 "depth": depth,
-                "parquet_files": written_files,
+                "artifact_files": written_files,
             }
             if bool(args.json_output):
                 print(json.dumps(output, indent=2))
             logger.info(
                 "silver-builder run summary status=complete elapsed_s=%.3f bronze_lake_root=%s "
-                "silver_lake_root=%s depth=%s parquet_files=%s",
+                "silver_lake_root=%s depth=%s artifact_files=%s",
                 elapsed_s,
                 bronze_lake_root,
                 silver_lake_root,
@@ -422,6 +498,51 @@ def _run_silver_builder(args: argparse.Namespace, logger: logging.Logger) -> Non
             )
     except SingleInstanceError as exc:
         logger.warning("Single-instance lock active for silver-builder")
+        raise SystemExit(str(exc)) from exc
+
+
+def _run_gold_builder(args: argparse.Namespace, logger: logging.Logger) -> None:
+    """Run Silver-to-Gold M1 L2 feature transformation."""
+
+    try:
+        with SingleInstanceLock(GOLD_BUILDER_LOCK_PATH):
+            started_at = perf_counter()
+            silver_lake_root = cast(str, args.silver_lake_root)
+            gold_lake_root = cast(str, args.gold_lake_root)
+            expected_snapshots_per_minute = int(args.expected_snapshots_per_minute)
+            completeness_threshold = float(args.completeness_threshold)
+            written_files = transform_l2_silver_to_gold(
+                silver_lake_root=silver_lake_root,
+                gold_lake_root=gold_lake_root,
+                expected_snapshots_per_minute=expected_snapshots_per_minute,
+                completeness_threshold=completeness_threshold,
+                plot=bool(args.plot),
+                manifest=bool(args.manifest),
+            )
+            elapsed_s = perf_counter() - started_at
+            output = {
+                "command": GOLD_BUILDER_COMMAND,
+                "status": "complete",
+                "silver_lake_root": silver_lake_root,
+                "gold_lake_root": gold_lake_root,
+                "expected_snapshots_per_minute": expected_snapshots_per_minute,
+                "completeness_threshold": completeness_threshold,
+                "artifact_files": written_files,
+            }
+            if bool(args.json_output):
+                print(json.dumps(output, indent=2))
+            logger.info(
+                "gold-builder run summary status=complete elapsed_s=%.3f silver_lake_root=%s "
+                "gold_lake_root=%s expected_snapshots_per_minute=%s completeness_threshold=%.3f artifact_files=%s",
+                elapsed_s,
+                silver_lake_root,
+                gold_lake_root,
+                expected_snapshots_per_minute,
+                completeness_threshold,
+                len(written_files),
+            )
+    except SingleInstanceError as exc:
+        logger.warning("Single-instance lock active for gold-builder")
         raise SystemExit(str(exc)) from exc
 
 
@@ -496,6 +617,8 @@ def main() -> None:
         _run_bronze_builder(args=args, logger=logger, config=config)
     elif args.command == SILVER_BUILDER_COMMAND:
         _run_silver_builder(args=args, logger=logger)
+    elif args.command == GOLD_BUILDER_COMMAND:
+        _run_gold_builder(args=args, logger=logger)
     elif args.command == VALIDATE_SYMBOLS_COMMAND:
         _run_validate_symbols(args=args, logger=logger)
 

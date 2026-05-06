@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
-from datetime import datetime
+import json
+import math
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import cast
+from typing import Any, cast
 
 import polars as pl
 
@@ -34,6 +36,8 @@ def transform_l2_bronze_to_silver(
     bronze_lake_root: str,
     silver_lake_root: str,
     depth: int = 50,
+    plot: bool = True,
+    manifest: bool = True,
 ) -> list[str]:
     """Transform bronze L2 parquet snapshots into monthly silver feature partitions."""
 
@@ -46,7 +50,12 @@ def transform_l2_bronze_to_silver(
 
     bronze = pl.read_parquet([str(path) for path in bronze_files])
     silver = silver_l2_features_from_bronze(bronze=bronze, depth=depth)
-    return save_silver_l2_snapshot_features(silver=silver, lake_root=silver_lake_root)
+    return save_silver_l2_snapshot_features(
+        silver=silver,
+        lake_root=silver_lake_root,
+        plot=plot,
+        manifest=manifest,
+    )
 
 
 def silver_l2_features_from_bronze(bronze: pl.DataFrame, depth: int = 50) -> pl.DataFrame:
@@ -144,8 +153,13 @@ def silver_l2_features_from_bronze(bronze: pl.DataFrame, depth: int = 50) -> pl.
     )
 
 
-def save_silver_l2_snapshot_features(silver: pl.DataFrame, lake_root: str) -> list[str]:
-    """Persist silver L2 feature rows to monthly parquet partitions idempotently."""
+def save_silver_l2_snapshot_features(
+    silver: pl.DataFrame,
+    lake_root: str,
+    plot: bool = True,
+    manifest: bool = True,
+) -> list[str]:
+    """Persist silver L2 feature rows and monthly artifact files idempotently."""
 
     written_files: list[str] = []
     if silver.is_empty():
@@ -161,19 +175,113 @@ def save_silver_l2_snapshot_features(silver: pl.DataFrame, lake_root: str) -> li
         )
         part_dir = silver_l2_snapshot_partition_path(lake_root=lake_root, key=key)
         part_dir.mkdir(parents=True, exist_ok=True)
-        file_path = part_dir / "data.parquet"
+        month_partition = key[3]
+        file_path = part_dir / f"{month_partition}.parquet"
         staging_path = part_dir / f".staging-{datetime.now().strftime('%Y%m%dT%H%M%S%f')}.parquet"
+        metadata_path = part_dir / f"{month_partition}.json"
+        plot_path = part_dir / f"{month_partition}.png"
+        legacy_file_path = part_dir / "data.parquet"
 
         output = partition
-        if file_path.exists():
-            output = pl.concat([pl.read_parquet(file_path), partition], how="vertical")
+        existing_file_path = file_path if file_path.exists() else legacy_file_path
+        if existing_file_path.exists():
+            output = pl.concat([pl.read_parquet(existing_file_path), partition], how="vertical")
 
         output = output.unique(subset=SILVER_NATURAL_KEY, keep="last").sort("ts_event")
         output.write_parquet(staging_path)
         staging_path.replace(file_path)
+
         written_files.append(str(file_path.resolve()))
+        if manifest:
+            metadata_path.write_text(
+                json.dumps(silver_artifact_metadata(output), indent=2, sort_keys=True),
+                encoding="utf-8",
+            )
+            written_files.append(str(metadata_path.resolve()))
+        if plot:
+            write_silver_profile_png(silver=output, path=plot_path)
+            written_files.append(str(plot_path.resolve()))
 
     return sorted(written_files)
+
+
+def silver_artifact_metadata(silver: pl.DataFrame) -> dict[str, Any]:
+    """Build JSON metadata for one monthly silver artifact without filesystem paths."""
+
+    ts_min = _scalar(silver["ts_event"].min()) if "ts_event" in silver.columns and silver.height else None
+    ts_max = _scalar(silver["ts_event"].max()) if "ts_event" in silver.columns and silver.height else None
+    return {
+        "dataset_type": SILVER_L2_FEATURE_DATASET_TYPE,
+        "schema_version": SILVER_SCHEMA_VERSION,
+        "build_timestamp_utc": datetime.now(UTC).isoformat(),
+        "row_count": silver.height,
+        "column_count": len(silver.columns),
+        "timestamp_min": ts_min,
+        "timestamp_max": ts_max,
+        "symbols": (
+            sorted(str(symbol) for symbol in silver["symbol"].unique().to_list())
+            if "symbol" in silver.columns
+            else []
+        ),
+        "columns": [_column_metadata(silver, column) for column in silver.columns],
+    }
+
+
+def write_silver_profile_png(silver: pl.DataFrame, path: Path) -> None:
+    """Write a dark monthly Silver profile PNG with numeric feature lines and histograms."""
+
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    numeric_features = [
+        column
+        for column in silver.columns
+        if silver[column].dtype.is_numeric() and column not in {"depth"}
+    ]
+    if not numeric_features:
+        path.touch()
+        return
+
+    row_count = len(numeric_features)
+    fig_height = max(6.0, row_count * 1.05)
+    fig, axes = plt.subplots(
+        nrows=row_count,
+        ncols=2,
+        figsize=(18, fig_height),
+        gridspec_kw={"width_ratios": [4, 1]},
+        squeeze=False,
+    )
+    fig.patch.set_facecolor("#111217")
+    ts_values = silver["ts_event"].to_list() if "ts_event" in silver.columns else list(range(silver.height))
+    symbol = silver["symbol"][0] if silver.height and "symbol" in silver.columns else "unknown"
+    month = silver["month"][0] if silver.height and "month" in silver.columns else "unknown"
+    legend = f"{symbol} | month={month} | rows={silver.height}"
+
+    for index, feature in enumerate(numeric_features):
+        values = silver[feature].to_list()
+        clean_values = [value for value in values if isinstance(value, int | float) and math.isfinite(float(value))]
+        line_ax = axes[index][0]
+        hist_ax = axes[index][1]
+        for ax in (line_ax, hist_ax):
+            ax.set_facecolor("#161922")
+            ax.tick_params(colors="#d8dee9", labelsize=7)
+            for spine in ax.spines.values():
+                spine.set_color("#3b4252")
+        line_ax.plot(ts_values, values, color="#88c0d0", linewidth=0.8)
+        line_ax.set_ylabel(feature, color="#eceff4", fontsize=7)
+        if index == 0:
+            line_ax.set_title("Silver numeric feature lines", color="#eceff4", fontsize=11)
+            line_ax.legend([legend], loc="upper left", fontsize=7, facecolor="#161922", labelcolor="#eceff4")
+            hist_ax.set_title("Distribution", color="#eceff4", fontsize=11)
+        if clean_values:
+            hist_ax.hist(clean_values, bins=min(24, max(4, len(clean_values))), color="#a3be8c", alpha=0.85)
+
+    fig.autofmt_xdate(rotation=20)
+    fig.tight_layout()
+    fig.savefig(path, dpi=120, facecolor=fig.get_facecolor())
+    plt.close(fig)
 
 
 def _depth_volume_exprs() -> list[pl.Expr]:
@@ -254,6 +362,36 @@ def _flag_expr(condition: pl.Expr, flag: str) -> pl.Expr:
     """Return a one-item flag list when a validation condition is true."""
 
     return pl.when(condition.fill_null(False)).then(pl.lit([flag])).otherwise(pl.lit([]))
+
+
+def _column_metadata(silver: pl.DataFrame, column: str) -> dict[str, Any]:
+    """Return dtype, null count, and numeric stats for one Silver column."""
+
+    series = silver[column]
+    metadata: dict[str, Any] = {
+        "name": column,
+        "dtype": str(series.dtype),
+        "null_count": int(series.null_count()),
+        "null_ratio": float(series.null_count() / max(1, silver.height)),
+    }
+    if series.dtype.is_numeric():
+        metadata["numeric_stats"] = {
+            "mean": _scalar(series.mean()),
+            "std": _scalar(series.std()),
+            "min": _scalar(series.min()),
+            "max": _scalar(series.max()),
+        }
+    return metadata
+
+
+def _scalar(value: object) -> object:
+    """Convert scalar values to JSON-safe representations."""
+
+    if isinstance(value, datetime):
+        return value.isoformat()
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
+    return value
 
 
 def silver_record_natural_key(record: dict[str, object]) -> tuple[str, str, str, str, int, datetime]:

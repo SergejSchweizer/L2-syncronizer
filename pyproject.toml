@@ -9,6 +9,7 @@ description = "Framework for crypto L2 and market data ingestion"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
+  "matplotlib>=3.10.0",
   "polars>=1.36.1",
   "pyarrow>=24.0.0",
 ]

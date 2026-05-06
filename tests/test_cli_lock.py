@@ -13,7 +13,7 @@ import pytest
 
 from api import cli
 from api.cli import SingleInstanceError, SingleInstanceLock
-from api.constants import BRONZE_BUILDER_COMMAND, SILVER_BUILDER_COMMAND
+from api.constants import BRONZE_BUILDER_COMMAND, GOLD_BUILDER_COMMAND, SILVER_BUILDER_COMMAND
 from api.runtime import configure_logging
 from ingestion.config import Config
 from ingestion.l2 import L2Snapshot
@@ -38,6 +38,7 @@ def _config(
     save_parquet_lake: bool = False,
     lake_root: str = "lake/bronze",
     silver_lake_root: str = "lake/silver",
+    gold_lake_root: str = "lake/gold",
     json_output: bool = True,
 ) -> Config:
     """Build a minimal test config."""
@@ -64,6 +65,7 @@ def _config(
             "save_parquet_lake": save_parquet_lake,
             "lake_root": lake_root,
             "silver_lake_root": silver_lake_root,
+            "gold_lake_root": gold_lake_root,
             "json_output": json_output,
         },
     }
@@ -185,6 +187,24 @@ def test_silver_builder_parser_defaults_can_come_from_config() -> None:
     assert args.bronze_lake_root == "custom/bronze"
     assert args.silver_lake_root == "custom/silver"
     assert args.depth == 25
+    assert args.json_output is False
+
+
+def test_gold_builder_parser_defaults_can_come_from_config() -> None:
+    """Verify gold-builder defaults are configurable through config."""
+
+    args = cli.build_parser(
+        _config(
+            silver_lake_root="custom/silver",
+            gold_lake_root="custom/gold",
+            json_output=False,
+        )
+    ).parse_args([GOLD_BUILDER_COMMAND])
+
+    assert args.silver_lake_root == "custom/silver"
+    assert args.gold_lake_root == "custom/gold"
+    assert args.expected_snapshots_per_minute == 6
+    assert args.completeness_threshold == 0.8
     assert args.json_output is False
 
 
@@ -444,10 +464,15 @@ def test_main_silver_builder_outputs_written_files(
             del exc_type, exc, tb
 
     calls: list[dict[str, object]] = []
+    artifact_files = [
+        "/tmp/lake/silver/dataset_type=l2_snapshot_features/month=2026-05/2026-05.parquet",
+        "/tmp/lake/silver/dataset_type=l2_snapshot_features/month=2026-05/2026-05.json",
+        "/tmp/lake/silver/dataset_type=l2_snapshot_features/month=2026-05/2026-05.png",
+    ]
 
     def fake_transform_l2_bronze_to_silver(**kwargs: object) -> list[str]:
         calls.append(kwargs)
-        return ["/tmp/lake/silver/dataset_type=l2_snapshot_features/data.parquet"]
+        return artifact_files
 
     monkeypatch.setattr(cli, "SingleInstanceLock", NoopLock)
     monkeypatch.setattr(cli, "transform_l2_bronze_to_silver", fake_transform_l2_bronze_to_silver)
@@ -469,12 +494,14 @@ def test_main_silver_builder_outputs_written_files(
 
     output = json.loads(capsys.readouterr().out)
     assert output["command"] == SILVER_BUILDER_COMMAND
-    assert output["parquet_files"] == ["/tmp/lake/silver/dataset_type=l2_snapshot_features/data.parquet"]
+    assert output["artifact_files"] == artifact_files
     assert calls == [
         {
             "bronze_lake_root": "custom/bronze",
             "silver_lake_root": "custom/silver",
             "depth": 50,
+            "plot": True,
+            "manifest": True,
         }
     ]
 
@@ -505,4 +532,202 @@ def test_main_silver_builder_uses_single_instance_lock(monkeypatch: pytest.Monke
     )
 
     with pytest.raises(SystemExit, match="silver builder already running"):
+        cli.main()
+
+
+def test_main_silver_builder_respects_plot_and_manifest_flags(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Verify silver-builder passes plot and manifest flags through to the transform."""
+
+    class NoopLock:
+        def __init__(self, lock_path: str) -> None:
+            del lock_path
+
+        def __enter__(self) -> None:
+            return None
+
+        def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
+            del exc_type, exc, tb
+
+    calls: list[dict[str, object]] = []
+    artifact_files = ["/tmp/lake/silver/dataset_type=l2_snapshot_features/month=2026-05/2026-05.parquet"]
+
+    def fake_transform_l2_bronze_to_silver(**kwargs: object) -> list[str]:
+        calls.append(kwargs)
+        return artifact_files
+
+    monkeypatch.setattr(cli, "SingleInstanceLock", NoopLock)
+    monkeypatch.setattr(cli, "transform_l2_bronze_to_silver", fake_transform_l2_bronze_to_silver)
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "main.py",
+            SILVER_BUILDER_COMMAND,
+            "--bronze-lake-root",
+            "custom/bronze",
+            "--silver-lake-root",
+            "custom/silver",
+            "--depth",
+            "50",
+            "--no-plot",
+            "--no-manifest",
+        ],
+    )
+
+    cli.main()
+
+    assert calls == [
+        {
+            "bronze_lake_root": "custom/bronze",
+            "silver_lake_root": "custom/silver",
+            "depth": 50,
+            "plot": False,
+            "manifest": False,
+        }
+    ]
+
+
+def test_main_gold_builder_outputs_artifact_files(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Verify gold-builder runs the Silver-to-Gold transform."""
+
+    class NoopLock:
+        """Test double that allows gold-builder to run."""
+
+        def __init__(self, lock_path: str) -> None:
+            del lock_path
+
+        def __enter__(self) -> None:
+            return None
+
+        def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
+            del exc_type, exc, tb
+
+    calls: list[dict[str, object]] = []
+
+    def fake_transform_l2_silver_to_gold(**kwargs: object) -> list[str]:
+        calls.append(kwargs)
+        return ["/tmp/lake/gold/BTC_hash_commit.parquet"]
+
+    monkeypatch.setattr(cli, "SingleInstanceLock", NoopLock)
+    monkeypatch.setattr(cli, "transform_l2_silver_to_gold", fake_transform_l2_silver_to_gold)
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "main.py",
+            GOLD_BUILDER_COMMAND,
+            "--silver-lake-root",
+            "custom/silver",
+            "--gold-lake-root",
+            "custom/gold",
+            "--expected-snapshots-per-minute",
+            "6",
+            "--completeness-threshold",
+            "0.8",
+        ],
+    )
+
+    cli.main()
+
+    output = json.loads(capsys.readouterr().out)
+    assert output["command"] == GOLD_BUILDER_COMMAND
+    assert output["artifact_files"] == ["/tmp/lake/gold/BTC_hash_commit.parquet"]
+    assert calls == [
+        {
+            "silver_lake_root": "custom/silver",
+            "gold_lake_root": "custom/gold",
+            "expected_snapshots_per_minute": 6,
+            "completeness_threshold": 0.8,
+            "plot": True,
+            "manifest": True,
+        }
+    ]
+
+
+def test_main_gold_builder_respects_plot_and_manifest_flags(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Verify gold-builder passes plot and manifest flags through to the transform."""
+
+    class NoopLock:
+        def __init__(self, lock_path: str) -> None:
+            del lock_path
+
+        def __enter__(self) -> None:
+            return None
+
+        def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
+            del exc_type, exc, tb
+
+    calls: list[dict[str, object]] = []
+
+    def fake_transform_l2_silver_to_gold(**kwargs: object) -> list[str]:
+        calls.append(kwargs)
+        return ["/tmp/lake/gold/BTC_hash_commit.parquet"]
+
+    monkeypatch.setattr(cli, "SingleInstanceLock", NoopLock)
+    monkeypatch.setattr(cli, "transform_l2_silver_to_gold", fake_transform_l2_silver_to_gold)
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "main.py",
+            GOLD_BUILDER_COMMAND,
+            "--silver-lake-root",
+            "custom/silver",
+            "--gold-lake-root",
+            "custom/gold",
+            "--expected-snapshots-per-minute",
+            "6",
+            "--completeness-threshold",
+            "0.8",
+            "--no-plot",
+            "--no-manifest",
+        ],
+    )
+
+    cli.main()
+
+    assert calls == [
+        {
+            "silver_lake_root": "custom/silver",
+            "gold_lake_root": "custom/gold",
+            "expected_snapshots_per_minute": 6,
+            "completeness_threshold": 0.8,
+            "plot": False,
+            "manifest": False,
+        }
+    ]
+
+
+def test_main_gold_builder_uses_single_instance_lock(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Verify gold-builder exits when the single-instance lock is held."""
+
+    class Locked:
+        """Test double that simulates an already-running gold-builder."""
+
+        def __init__(self, lock_path: str) -> None:
+            del lock_path
+
+        def __enter__(self) -> None:
+            raise SingleInstanceError("gold builder already running")
+
+        def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
+            del exc_type, exc, tb
+
+    monkeypatch.setattr(cli, "SingleInstanceLock", Locked)
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "main.py",
+            GOLD_BUILDER_COMMAND,
+            "--no-json-output",
+        ],
+    )
+
+    with pytest.raises(SystemExit, match="gold builder already running"):
         cli.main()

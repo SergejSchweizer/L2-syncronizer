@@ -3,17 +3,18 @@
 ## Project Overview
 
 `crypto-l2-loader` is a focused Deribit Level 2 order book ingestion tool. It collects bounded public order book snapshots, normalizes them into typed `L2Snapshot` records, and persists raw snapshots to a local bronze Parquet lake.
-It also includes a Polars-based Bronze-to-Silver transform for fixed-width L2 snapshot feature rows.
+It also includes Polars-based Silver and Gold transforms for fixed-width L2 snapshot features and M1 aggregate artifacts.
 
 Current scope is intentionally narrow:
 
 - Fetch Deribit perpetual L2 order book snapshots through the public REST API.
 - Poll multiple symbols concurrently with bounded runtime controls.
 - Optionally persist raw snapshots to idempotent daily bronze Parquet partitions.
-- Expose ingestion and transform CLI commands: `bronze-builder` and `silver-builder`.
+- Expose ingestion and transform CLI commands: `bronze-builder`, `silver-builder`, and `gold-builder`.
 - Validate symbol aliases before scheduled jobs with `validate-symbols`.
+- Review the implementation and optimization summary in `REPORT.md`.
 
-Former OHLCV, M1 aggregation, standalone open-interest, standalone funding, plotting, research-report, and database-ingestion surfaces have been removed.
+Former OHLCV, standalone open-interest, standalone funding, research-report, and database-ingestion surfaces have been removed.
 
 ## Architecture
 
@@ -34,7 +35,10 @@ CLI (validate-symbols)
 Lake transform
   -> silver-builder CLI command
   -> Polars Bronze-to-Silver snapshot feature transform
-  -> Monthly silver Parquet feature partitions
+  -> Monthly silver Parquet, JSON metadata, and PNG profile artifacts
+  -> gold-builder CLI command
+  -> Polars Silver-to-Gold M1 aggregation
+  -> Per-symbol Parquet, JSON metadata, and PNG profile artifacts
 ```
 
 Current top-level code layout:
@@ -82,8 +86,9 @@ Runtime dependencies are declared in `pyproject.toml`:
 
 | Package | Used For |
 |---|---|
+| `matplotlib` | Silver and Gold profile PNG artifact generation. |
 | `pyarrow` | Bronze and Silver Parquet file reads/writes. |
-| `polars` | Bronze-to-Silver L2 feature transformations. |
+| `polars` | Bronze-to-Silver L2 features and Silver-to-Gold M1 transformations. |
 
 Development dependencies are grouped under the `dev` extra and cover `pytest`, `ruff`, and `mypy`.
 
@@ -111,8 +116,27 @@ Supported config keys:
 | `ingestion.max_runtime_s` | Optional runtime budget. Defaults to `50` seconds. `0` disables the budget. |
 | `ingestion.save_parquet_lake` | Save raw L2 snapshots to the bronze Parquet lake when true. |
 | `ingestion.lake_root` | Parquet lake root directory. |
-| `ingestion.silver_lake_root` | Silver Parquet lake root directory. Defaults to `lake/silver`. |
+| `ingestion.silver_lake_root` | Silver artifact lake root directory. Defaults to `lake/silver`. |
+| `ingestion.gold_lake_root` | Gold artifact root directory. Defaults to `lake/gold`. |
 | `ingestion.json_output` | Print CLI JSON output when true. |
+
+## Current Jobs
+
+The production cron setup runs the three data-layer builders once per minute from the repository root:
+
+```cron
+* * * * * cd /home/vcs/git/crypto-l2-loader && .venv/bin/python main.py bronze-builder --symbols BTC ETH SOL
+* * * * * cd /home/vcs/git/crypto-l2-loader && .venv/bin/python main.py silver-builder
+* * * * * cd /home/vcs/git/crypto-l2-loader && .venv/bin/python main.py gold-builder
+```
+
+| Job | Purpose | Reads | Writes | Log File | Lock File |
+|---|---|---|---|---|---|
+| `bronze-builder` | Poll Deribit REST L2 snapshots for BTC, ETH, and SOL. | Deribit public order book API. | Daily Bronze Parquet partitions under `lake/bronze/`. | `.logs/bronze-builder.log` | `/tmp/crypto-l2-loader-bronze-builder.lock` |
+| `silver-builder` | Transform Bronze snapshots into fixed-width Silver snapshot feature rows. | `lake/bronze/` | Monthly Silver Parquet, JSON metadata, and PNG profile artifacts under `lake/silver/`. | `.logs/silver-builder.log` | `/tmp/crypto-l2-loader-silver-builder.lock` |
+| `gold-builder` | Aggregate Silver features into M1 Gold artifacts. | `lake/silver/` | Per-symbol Parquet, JSON metadata, and PNG profile artifacts under `lake/gold/`. | `.logs/gold-builder.log` | `/tmp/crypto-l2-loader-gold-builder.lock` |
+
+Each job uses a non-blocking single-instance lock and exits fast when a previous run is still active. Logs rotate weekly, and rotated logs are kept indefinitely by default.
 
 ## Usage
 
@@ -171,24 +195,65 @@ python main.py silver-builder [options]
 | Option | Meaning |
 |---|---|
 | `--bronze-lake-root BRONZE_LAKE_ROOT` | Root directory for bronze Parquet input files. Defaults to `lake/bronze`. |
-| `--silver-lake-root SILVER_LAKE_ROOT` | Root directory for silver Parquet output files. Defaults to `lake/silver`. |
+| `--silver-lake-root SILVER_LAKE_ROOT` | Root directory for Silver output artifact files. Defaults to `lake/silver`. |
 | `--depth DEPTH` | Expected book depth used for fixed-width Silver arrays. Defaults to `50`. |
+| `--plot`, `--no-plot` | Enable or suppress Silver PNG profile generation. Defaults to enabled. |
+| `--manifest`, `--no-manifest` | Enable or suppress Silver JSON metadata manifest generation. Defaults to enabled. |
 | `--json-output`, `--no-json-output` | Enable or suppress JSON output. Logs are still emitted. |
 
-Transform Bronze L2 snapshots into monthly Silver snapshot feature partitions:
+Transform Bronze L2 snapshots into monthly Silver snapshot feature artifacts:
 
 ```bash
 python main.py silver-builder
 ```
 
-Cron example for the Bronze and Silver jobs:
+The Silver job logs to `.logs/silver-builder.log` by default and uses `/tmp/crypto-l2-loader-silver-builder.lock` to avoid overlapping transforms.
 
-```cron
-* * * * * cd /home/vcs/git/crypto-l2-loader && .venv/bin/python main.py bronze-builder --symbols BTC ETH SOL
-* * * * * cd /home/vcs/git/crypto-l2-loader && .venv/bin/python main.py silver-builder
+Each Silver month partition writes three artifacts. The parquet file is named by month, and the metadata/plot files use the same month marker:
+
+```text
+YYYY-MM.parquet
+YYYY-MM.json
+YYYY-MM.png
 ```
 
-The Silver job logs to `.logs/silver-builder.log` by default and uses `/tmp/crypto-l2-loader-silver-builder.lock` to avoid overlapping transforms.
+### Gold Builder
+
+```text
+python main.py gold-builder [options]
+```
+
+| Option | Meaning |
+|---|---|
+| `--silver-lake-root SILVER_LAKE_ROOT` | Root directory for Silver Parquet input files. Defaults to `lake/silver`. |
+| `--gold-lake-root GOLD_LAKE_ROOT` | Root directory for Gold artifact output files. Defaults to `lake/gold`. |
+| `--expected-snapshots-per-minute EXPECTED` | Expected Silver snapshots per minute for quality coverage. Defaults to `6`. |
+| `--completeness-threshold THRESHOLD` | Minimum coverage ratio for a complete minute. Defaults to `0.8`. |
+| `--plot`, `--no-plot` | Enable or suppress Gold PNG profile generation. Defaults to enabled. |
+| `--manifest`, `--no-manifest` | Enable or suppress Gold JSON metadata manifest generation. Defaults to enabled. |
+| `--json-output`, `--no-json-output` | Enable or suppress JSON output. Logs are still emitted. |
+
+Transform Silver L2 snapshot features into M1 Gold artifacts:
+
+```bash
+python main.py gold-builder
+```
+
+Gold is M1-only. It does not forward-fill missing minutes. Each minute uses first/max/min/last/mean/std semantics inside the minute. With the default quality policy, `expected_snapshots_per_minute = 6`, `coverage_ratio = snapshot_count / 6`, and `is_complete_minute = coverage_ratio >= 0.8`.
+
+For each base asset symbol, Gold writes three artifacts with the same basename:
+
+```text
+lake/gold/BTC_<jsonhash>_<gitcommithash>.parquet
+lake/gold/BTC_<jsonhash>_<gitcommithash>.json
+lake/gold/BTC_<jsonhash>_<gitcommithash>.png
+```
+
+The JSON metadata contains dataset-level and feature-level metadata, including hash string, UTC build timestamp, row/column stats, timestamp bounds, source Silver dataset summaries, and per-feature dtype/null/numeric distribution stats. It intentionally does not store filesystem paths.
+
+The PNG profile uses the same basename. It plots all numeric Gold features as feature rows: line plots on the left panel and dark distribution histograms on the right panel.
+
+The Gold job logs to `.logs/gold-builder.log` by default and uses `/tmp/crypto-l2-loader-gold-builder.lock` to avoid overlapping transforms.
 
 Validate symbols before adding them to cron:
 
@@ -211,7 +276,7 @@ lake/bronze/
                   data.parquet
 ```
 
-The Silver Parquet layout is monthly to avoid unnecessary small-file fragmentation:
+The Silver artifact layout is monthly to avoid unnecessary small-file fragmentation:
 
 ```text
 lake/silver/
@@ -220,7 +285,24 @@ lake/silver/
       instrument_type=perp/
         symbol=BTC-PERPETUAL/
           month=YYYY-MM/
-            data.parquet
+            YYYY-MM.parquet
+            YYYY-MM.json
+            YYYY-MM.png
+```
+
+The Gold artifact layout is flat by base asset and reproducibility suffix:
+
+```text
+lake/gold/
+  BTC_<jsonhash>_<gitcommithash>.parquet
+  BTC_<jsonhash>_<gitcommithash>.json
+  BTC_<jsonhash>_<gitcommithash>.png
+  ETH_<jsonhash>_<gitcommithash>.parquet
+  ETH_<jsonhash>_<gitcommithash>.json
+  ETH_<jsonhash>_<gitcommithash>.png
+  SOL_<jsonhash>_<gitcommithash>.parquet
+  SOL_<jsonhash>_<gitcommithash>.json
+  SOL_<jsonhash>_<gitcommithash>.png
 ```
 
 ## Modules
@@ -235,7 +317,8 @@ lake/silver/
 | `ingestion/exchanges/deribit_l2.py` | Deribit order book adapter and symbol normalization. |
 | `ingestion/l2.py` | L2 dataclasses, async polling, and snapshot normalization. |
 | `ingestion/lake.py` | Idempotent Parquet writer for raw L2 snapshots. |
-| `ingestion/silver.py` | Polars Bronze-to-Silver transform and monthly Silver feature writer. |
+| `ingestion/silver.py` | Polars Bronze-to-Silver transform and monthly Silver artifact writer. |
+| `ingestion/gold.py` | Polars Silver-to-Gold M1 aggregation, metadata, and PNG artifact writer. |
 
 ## Data Dictionary
 
@@ -282,6 +365,21 @@ Silver L2 snapshot feature rows are derived from Bronze with Polars:
 | `microprice` | Top-of-book size-weighted microprice. |
 | `mark_price`, `index_price`, `open_interest`, `funding_rate`, `funding_8h` | Deribit market fields carried into Silver. |
 | `is_valid`, `validation_flags` | Deterministic book validation status and reason flags. |
+
+Gold M1 rows are derived from Silver:
+
+| Field | Meaning |
+|---|---|
+| `ts_minute`, `exchange`, `symbol`, `instrument_type`, `depth`, `feature_set_version` | M1 feature identity. |
+| `snapshot_count`, `coverage_ratio`, `first_snapshot_ts`, `last_snapshot_ts` | Minute coverage metadata. |
+| `mid_open`, `mid_high`, `mid_low`, `mid_close`, `mid_mean`, `mid_std` | M1 mid-price features. |
+| `spread_bps_mean`, `spread_bps_max`, `spread_bps_p95` | M1 spread features. |
+| `microprice_mean`, `microprice_close`, `microprice_minus_mid_mean` | M1 microprice features. |
+| `imbalance_N_mean` | Mean imbalance for depth windows `1`, `5`, `10`, `20`, and `50`. |
+| `bid_volume_N_mean`, `ask_volume_N_mean` | Mean cumulative book size for each depth window. |
+| `book_pressure_N_mean` | Mean `bid_volume_N / (bid_volume_N + ask_volume_N)` for each depth window. |
+| `mark_price_last`, `index_price_last`, `open_interest_last`, `funding_rate_last` | Last market fields in the minute. |
+| `is_complete_minute`, `quality_flags` | Gold quality status. |
 
 ## Testing
 

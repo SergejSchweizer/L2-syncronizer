@@ -19,4 +19,5 @@ ingestion:
   save_parquet_lake: true
   lake_root: lake/bronze
   silver_lake_root: lake/silver
+  gold_lake_root: lake/gold
   json_output: false

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -89,6 +90,29 @@ def test_silver_l2_features_from_bronze_computes_snapshot_features(tmp_path: Pat
     assert row["validation_flags"] == ["insufficient_bid_depth", "insufficient_ask_depth"]
 
 
+def test_transform_l2_bronze_to_silver_skips_manifest_and_plot_when_disabled(tmp_path: Path) -> None:
+    """Verify Silver writes only parquet when plot and manifest generation are disabled."""
+
+    bronze_root = tmp_path / "bronze"
+    silver_root = tmp_path / "silver"
+    snapshot = _sample_l2_snapshot()
+    save_l2_snapshot_parquet_lake({"BTC": [snapshot]}, lake_root=str(bronze_root), depth=50)
+
+    files = transform_l2_bronze_to_silver(
+        bronze_lake_root=str(bronze_root),
+        silver_lake_root=str(silver_root),
+        depth=50,
+        plot=False,
+        manifest=False,
+    )
+
+    assert len(files) == 1
+    assert files[0].endswith("2026-05.parquet")
+    assert Path(files[0]).exists()
+    assert not any(path.name.endswith(".json") for path in Path(silver_root).rglob("*.json"))
+    assert not any(path.name.endswith(".png") for path in Path(silver_root).rglob("*.png"))
+
+
 def test_transform_l2_bronze_to_silver_writes_monthly_idempotent_partitions(tmp_path: Path) -> None:
     """Verify bronze-to-silver writes one deduplicated monthly feature partition."""
 
@@ -109,10 +133,24 @@ def test_transform_l2_bronze_to_silver_writes_monthly_idempotent_partitions(tmp_
     )
 
     assert first_files == second_files
-    assert len(first_files) == 1
-    assert "/dataset_type=l2_snapshot_features/exchange=deribit/instrument_type=perp/" in first_files[0]
-    assert "/symbol=BTC-PERPETUAL/month=2026-05/data.parquet" in first_files[0]
+    assert len(first_files) == 3
+    assert any(
+        "/dataset_type=l2_snapshot_features/exchange=deribit/instrument_type=perp/" in file_path
+        for file_path in first_files
+    )
+    assert any("/symbol=BTC-PERPETUAL/month=2026-05/2026-05.parquet" in file_path for file_path in first_files)
+    assert any("/symbol=BTC-PERPETUAL/month=2026-05/2026-05.json" in file_path for file_path in first_files)
+    assert any("/symbol=BTC-PERPETUAL/month=2026-05/2026-05.png" in file_path for file_path in first_files)
 
-    records = pl.read_parquet(first_files[0])
+    parquet_file = next(file_path for file_path in first_files if file_path.endswith("2026-05.parquet"))
+    json_file = next(file_path for file_path in first_files if file_path.endswith("2026-05.json"))
+    png_file = next(file_path for file_path in first_files if file_path.endswith("2026-05.png"))
+    records = pl.read_parquet(parquet_file)
+    metadata = json.loads(Path(json_file).read_text(encoding="utf-8"))
+
     assert records.height == 1
     assert records["ts_event"].to_list() == [snapshot.timestamp]
+    assert metadata["dataset_type"] == "l2_snapshot_features"
+    assert metadata["row_count"] == 1
+    assert metadata["symbols"] == ["BTC-PERPETUAL"]
+    assert Path(png_file).stat().st_size > 0
