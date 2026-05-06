@@ -1,0 +1,22 @@
+http:
+  timeout_s: 8
+  max_retries: 2
+  retry_backoff_s: 1
+
+runtime:
+  log_dir: .logs
+  log_rotation_days: 7
+  log_backup_count: 0
+  fetch_concurrency: 8
+
+ingestion:
+  exchange: deribit
+  symbols: [BTC, ETH, SOL]
+  levels: 50
+  snapshot_count: 5
+  poll_interval_s: 10
+  max_runtime_s: 50
+  save_parquet_lake: true
+  lake_root: lake/bronze
+  silver_lake_root: lake/silver
+  json_output: false

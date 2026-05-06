@@ -1,4 +1,4 @@
-"""L2 snapshot ingestion and M1 aggregation utilities."""
+"""L2 snapshot ingestion utilities."""
 
 from __future__ import annotations
 
@@ -7,7 +7,7 @@ import logging
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from time import monotonic
-from typing import TypedDict, cast
+from typing import cast
 
 from ingestion.exchanges.deribit_l2 import fetch_order_book_snapshot
 
@@ -63,66 +63,6 @@ class L2Snapshot:
     open_interest: float | None
     funding_8h: float | None
     current_funding: float | None
-
-
-@dataclass(frozen=True)
-class L2MinuteBar:
-    """One aggregated M1 feature row."""
-
-    minute_ts: datetime
-    exchange: str
-    symbol: str
-    snapshot_count: int
-    mid_open: float
-    mid_high: float
-    mid_low: float
-    mid_close: float
-    mark_close: float | None
-    index_close: float | None
-    spread_bps_mean: float
-    spread_bps_max: float
-    spread_bps_last: float
-    bid_depth_1_mean: float
-    ask_depth_1_mean: float
-    bid_depth_10_mean: float
-    ask_depth_10_mean: float
-    bid_depth_50_mean: float
-    ask_depth_50_mean: float
-    imbalance_1_mean: float | None
-    imbalance_10_mean: float | None
-    imbalance_50_mean: float | None
-    imbalance_10_last: float | None
-    imbalance_50_last: float | None
-    microprice_close: float | None
-    microprice_minus_mid_mean: float | None
-    bid_vwap_10_mean: float | None
-    ask_vwap_10_mean: float | None
-    open_interest_last: float | None
-    funding_8h_last: float | None
-    current_funding_last: float | None
-    fetch_duration_s_mean: float
-    fetch_duration_s_max: float
-    fetch_duration_s_last: float
-
-
-class SnapshotFeatures(TypedDict):
-    """Typed snapshot-level feature container."""
-
-    mid: float
-    spread_bps: float
-    bid_depth_1: float
-    ask_depth_1: float
-    bid_depth_10: float
-    ask_depth_10: float
-    bid_depth_50: float
-    ask_depth_50: float
-    imbalance_1: float | None
-    imbalance_10: float | None
-    imbalance_50: float | None
-    microprice: float | None
-    microprice_minus_mid: float | None
-    bid_vwap_10: float | None
-    ask_vwap_10: float | None
 
 
 def fetch_l2_snapshots_for_symbols(
@@ -306,97 +246,6 @@ async def _sleep_between_ticks(poll_interval_s: float, deadline: float | None) -
     return not _deadline_reached(deadline)
 
 
-def aggregate_snapshots_to_m1(snapshots: list[L2Snapshot]) -> list[L2MinuteBar]:
-    """Aggregate snapshots into M1 rows with unweighted means."""
-
-    grouped = _group_valid_snapshots_by_minute(snapshots)
-    return [_minute_bar_from_snapshots(key=key, snapshots=items) for key, items in sorted(grouped.items())]
-
-
-def _group_valid_snapshots_by_minute(
-    snapshots: list[L2Snapshot],
-) -> dict[tuple[str, str, datetime], list[L2Snapshot]]:
-    """Group valid non-crossed snapshots by exchange/symbol/minute."""
-
-    grouped: dict[tuple[str, str, datetime], list[L2Snapshot]] = {}
-    for snapshot in snapshots:
-        if not _is_valid_book_snapshot(snapshot):
-            continue
-        minute_ts = snapshot.timestamp.replace(second=0, microsecond=0)
-        key = (snapshot.exchange, snapshot.symbol, minute_ts)
-        grouped.setdefault(key, []).append(snapshot)
-    return grouped
-
-
-def _is_valid_book_snapshot(snapshot: L2Snapshot) -> bool:
-    """Return whether a snapshot has a usable non-crossed best book."""
-
-    if not snapshot.bids or not snapshot.asks:
-        return False
-    best_bid = snapshot.bids[0][0]
-    best_ask = snapshot.asks[0][0]
-    return best_bid > 0 and best_ask > 0 and best_bid < best_ask
-
-
-def _minute_bar_from_snapshots(
-    key: tuple[str, str, datetime],
-    snapshots: list[L2Snapshot],
-) -> L2MinuteBar:
-    """Aggregate one grouped minute of snapshots into an M1 feature row."""
-
-    exchange, symbol, minute_ts = key
-    ordered_snapshots = sorted(snapshots, key=lambda item: item.timestamp)
-    stats = [_snapshot_features(item) for item in ordered_snapshots]
-    last_snapshot = ordered_snapshots[-1]
-    fetch_durations = [item.fetch_duration_s for item in ordered_snapshots]
-
-    mids = _feature_values(stats, "mid")
-    spreads = _feature_values(stats, "spread_bps")
-    bid_depth_1 = _feature_values(stats, "bid_depth_1")
-    ask_depth_1 = _feature_values(stats, "ask_depth_1")
-    bid_depth_10 = _feature_values(stats, "bid_depth_10")
-    ask_depth_10 = _feature_values(stats, "ask_depth_10")
-    bid_depth_50 = _feature_values(stats, "bid_depth_50")
-    ask_depth_50 = _feature_values(stats, "ask_depth_50")
-
-    return L2MinuteBar(
-        minute_ts=minute_ts,
-        exchange=exchange,
-        symbol=symbol,
-        snapshot_count=len(stats),
-        mid_open=mids[0],
-        mid_high=max(mids),
-        mid_low=min(mids),
-        mid_close=mids[-1],
-        mark_close=last_snapshot.mark_price,
-        index_close=last_snapshot.index_price,
-        spread_bps_mean=_mean(spreads),
-        spread_bps_max=max(spreads),
-        spread_bps_last=spreads[-1],
-        bid_depth_1_mean=_mean(bid_depth_1),
-        ask_depth_1_mean=_mean(ask_depth_1),
-        bid_depth_10_mean=_mean(bid_depth_10),
-        ask_depth_10_mean=_mean(ask_depth_10),
-        bid_depth_50_mean=_mean(bid_depth_50),
-        ask_depth_50_mean=_mean(ask_depth_50),
-        imbalance_1_mean=_mean_or_none(_optional_feature_values(stats, "imbalance_1")),
-        imbalance_10_mean=_mean_or_none(_optional_feature_values(stats, "imbalance_10")),
-        imbalance_50_mean=_mean_or_none(_optional_feature_values(stats, "imbalance_50")),
-        imbalance_10_last=stats[-1]["imbalance_10"],
-        imbalance_50_last=stats[-1]["imbalance_50"],
-        microprice_close=stats[-1]["microprice"],
-        microprice_minus_mid_mean=_mean_or_none(_optional_feature_values(stats, "microprice_minus_mid")),
-        bid_vwap_10_mean=_mean_or_none(_optional_feature_values(stats, "bid_vwap_10")),
-        ask_vwap_10_mean=_mean_or_none(_optional_feature_values(stats, "ask_vwap_10")),
-        open_interest_last=last_snapshot.open_interest,
-        funding_8h_last=last_snapshot.funding_8h,
-        current_funding_last=last_snapshot.current_funding,
-        fetch_duration_s_mean=_mean(fetch_durations),
-        fetch_duration_s_max=max(fetch_durations),
-        fetch_duration_s_last=fetch_durations[-1],
-    )
-
-
 def _snapshot_from_raw(raw: dict[str, object], fetch_duration_s: float = 0.0) -> L2Snapshot:
     """Convert normalized adapter payload into ``L2Snapshot``."""
 
@@ -420,167 +269,52 @@ def _snapshot_from_raw(raw: dict[str, object], fetch_duration_s: float = 0.0) ->
     )
 
 
-def _snapshot_features(snapshot: L2Snapshot) -> SnapshotFeatures:
-    """Compute snapshot-level microstructure features."""
-
-    best_bid, bid_amount_1 = snapshot.bids[0]
-    best_ask, ask_amount_1 = snapshot.asks[0]
-    mid = (best_bid + best_ask) / 2.0
-    spread_bps = ((best_ask - best_bid) / mid) * 10_000.0
-
-    bid_depth_1 = _depth(snapshot.bids, 1)
-    ask_depth_1 = _depth(snapshot.asks, 1)
-    bid_depth_10 = _depth(snapshot.bids, 10)
-    ask_depth_10 = _depth(snapshot.asks, 10)
-    bid_depth_50 = _depth(snapshot.bids, 50)
-    ask_depth_50 = _depth(snapshot.asks, 50)
-
-    microprice = _microprice(best_bid, bid_amount_1, best_ask, ask_amount_1)
-
-    return {
-        "mid": mid,
-        "spread_bps": spread_bps,
-        "bid_depth_1": bid_depth_1,
-        "ask_depth_1": ask_depth_1,
-        "bid_depth_10": bid_depth_10,
-        "ask_depth_10": ask_depth_10,
-        "bid_depth_50": bid_depth_50,
-        "ask_depth_50": ask_depth_50,
-        "imbalance_1": _imbalance(bid_depth_1, ask_depth_1),
-        "imbalance_10": _imbalance(bid_depth_10, ask_depth_10),
-        "imbalance_50": _imbalance(bid_depth_50, ask_depth_50),
-        "microprice": microprice,
-        "microprice_minus_mid": None if microprice is None else microprice - mid,
-        "bid_vwap_10": _vwap(snapshot.bids, 10),
-        "ask_vwap_10": _vwap(snapshot.asks, 10),
-    }
-
-
-def _depth(levels: list[tuple[float, float]], limit: int) -> float:
-    """Return cumulative amount up to ``limit`` levels."""
-
-    return sum(amount for _, amount in levels[:limit])
-
-
-def _imbalance(bid_depth: float, ask_depth: float) -> float | None:
-    """Return side imbalance or ``None`` when denominator is zero."""
-
-    denominator = bid_depth + ask_depth
-    if denominator == 0:
-        return None
-    return (bid_depth - ask_depth) / denominator
-
-
-def _microprice(best_bid: float, bid_amount_1: float, best_ask: float, ask_amount_1: float) -> float | None:
-    """Return L1 microprice."""
-
-    denominator = bid_amount_1 + ask_amount_1
-    if denominator == 0:
-        return None
-    return ((best_ask * bid_amount_1) + (best_bid * ask_amount_1)) / denominator
-
-
-def _vwap(levels: list[tuple[float, float]], limit: int) -> float | None:
-    """Return side VWAP up to ``limit`` levels."""
-
-    subset = levels[:limit]
-    denominator = sum(amount for _, amount in subset)
-    if denominator == 0:
-        return None
-    numerator = sum(price * amount for price, amount in subset)
-    return numerator / denominator
-
-
-def _mean_or_none(values: list[float]) -> float | None:
-    """Return mean of values or ``None`` for empty lists."""
-
-    if not values:
-        return None
-    return _mean(values)
-
-
-def _mean(values: list[float]) -> float:
-    """Return arithmetic mean of a non-empty list."""
-
-    return sum(values) / len(values)
-
-
-def _feature_values(stats: list[SnapshotFeatures], key: str) -> list[float]:
-    """Return required numeric values for one snapshot feature."""
-
-    return [float(cast(int | float, cast(dict[str, object], item)[key])) for item in stats]
-
-
-def _optional_feature_values(stats: list[SnapshotFeatures], key: str) -> list[float]:
-    """Return present numeric values for one optional snapshot feature."""
-
-    values: list[float] = []
-    for item in stats:
-        value = cast(dict[str, object], item)[key]
-        if value is not None:
-            values.append(float(cast(int | float, value)))
-    return values
-
-
-def l2_m1_record(row: L2MinuteBar, run_id: str, ingested_at: datetime) -> dict[str, object]:
-    """Convert ``L2MinuteBar`` to parquet row format."""
+def l2_snapshot_record(
+    snapshot: L2Snapshot,
+    depth: int,
+    run_id: str,
+    ingested_at: datetime,
+    source: str = "rest_order_book",
+) -> dict[str, object]:
+    """Convert ``L2Snapshot`` to raw bronze parquet row format."""
 
     return {
         "schema_version": "v1",
-        "dataset_type": "l2_m1",
-        "exchange": row.exchange,
-        "symbol": row.symbol,
+        "dataset_type": "l2_snapshot",
+        "exchange": snapshot.exchange,
+        "symbol": snapshot.symbol,
         "instrument_type": "perp",
-        "event_time": row.minute_ts,
+        "event_time": snapshot.timestamp,
         "ingested_at": ingested_at,
         "run_id": run_id,
-        "source_endpoint": "public_l2_orderbook",
-        "open_time": row.minute_ts,
-        "close_time": row.minute_ts.replace(second=59, microsecond=999000),
-        "timeframe": "1m",
-        "snapshot_count": row.snapshot_count,
-        "mid_open": row.mid_open,
-        "mid_high": row.mid_high,
-        "mid_low": row.mid_low,
-        "mid_close": row.mid_close,
-        "mark_close": row.mark_close,
-        "index_close": row.index_close,
-        "spread_bps_mean": row.spread_bps_mean,
-        "spread_bps_max": row.spread_bps_max,
-        "spread_bps_last": row.spread_bps_last,
-        "bid_depth_1_mean": row.bid_depth_1_mean,
-        "ask_depth_1_mean": row.ask_depth_1_mean,
-        "bid_depth_10_mean": row.bid_depth_10_mean,
-        "ask_depth_10_mean": row.ask_depth_10_mean,
-        "bid_depth_50_mean": row.bid_depth_50_mean,
-        "ask_depth_50_mean": row.ask_depth_50_mean,
-        "imbalance_1_mean": row.imbalance_1_mean,
-        "imbalance_10_mean": row.imbalance_10_mean,
-        "imbalance_50_mean": row.imbalance_50_mean,
-        "imbalance_10_last": row.imbalance_10_last,
-        "imbalance_50_last": row.imbalance_50_last,
-        "microprice_close": row.microprice_close,
-        "microprice_minus_mid_mean": row.microprice_minus_mid_mean,
-        "bid_vwap_10_mean": row.bid_vwap_10_mean,
-        "ask_vwap_10_mean": row.ask_vwap_10_mean,
-        "open_interest_last": row.open_interest_last,
-        "funding_8h_last": row.funding_8h_last,
-        "current_funding_last": row.current_funding_last,
-        "fetch_duration_s_mean": row.fetch_duration_s_mean,
-        "fetch_duration_s_max": row.fetch_duration_s_max,
-        "fetch_duration_s_last": row.fetch_duration_s_last,
+        "source": source,
+        "depth": depth,
+        "fetch_duration_s": snapshot.fetch_duration_s,
+        "bids": [{"price": price, "amount": amount} for price, amount in snapshot.bids],
+        "asks": [{"price": price, "amount": amount} for price, amount in snapshot.asks],
+        "mark_price": snapshot.mark_price,
+        "index_price": snapshot.index_price,
+        "open_interest": snapshot.open_interest,
+        "funding_8h": snapshot.funding_8h,
+        "current_funding": snapshot.current_funding,
     }
 
 
-def l2_m1_partition_key(row: L2MinuteBar) -> tuple[str, str, str, str, str]:
-    """Build partition key for L2 M1 rows."""
+def l2_snapshot_partition_key(
+    snapshot: L2Snapshot,
+    depth: int,
+    source: str,
+) -> tuple[str, str, str, int, str, str, str]:
+    """Build raw bronze partition key for an L2 snapshot."""
 
     return (
-        row.exchange,
+        snapshot.exchange,
         "perp",
-        row.symbol,
-        "1m",
-        row.minute_ts.strftime("%Y-%m"),
+        snapshot.symbol,
+        depth,
+        source,
+        snapshot.timestamp.strftime("%Y-%m"),
+        snapshot.timestamp.strftime("%Y-%m-%d"),
     )
 
 

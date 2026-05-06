@@ -11,8 +11,8 @@
 !Makefile
 !main.py
 !pyproject.toml
+!config.yaml
 !.pre-commit-config.yaml
-!.env.example
 
 # Source and test trees.
 !api/
@@ -30,6 +30,7 @@ __pycache__/
 .mypy_cache/
 .ruff_cache/
 .cache/
+.logs/
 .ipynb_checkpoints/
 *.pyc
 *.egg-info/
@@ -40,5 +41,4 @@ exports/
 lake_test/
 .env
 .env.*
-!.env.example
 docker/.env

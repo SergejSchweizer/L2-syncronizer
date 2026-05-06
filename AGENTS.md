@@ -122,7 +122,7 @@ Always ignore and keep untracked (unless repo intentionally requires otherwise):
 - `.cache/`
 - `.ipynb_checkpoints/`
 - `.env`
-- `.env.*` (except explicit examples such as `.env.example`)
+- `.env.*`
 
 If local-only files are accidentally tracked, remove them from git index while keeping local copies.
 
@@ -157,9 +157,9 @@ Rules:
 # Security Rules
 
 - Never commit secrets or credentials.
-- Use environment variables and local config files.
+- Use `config.yaml` and local-only config files.
 - Keep sensitive config out of version control.
-- Provide `.env.example` (or equivalent) for required variables.
+- Provide tracked, non-secret example/default configuration for required variables.
 - Do not place live secret values in docs.
 
 ---
@@ -175,7 +175,7 @@ It should cover:
 - project overview
 - architecture summary
 - setup/install
-- current `loader-l2-m1` usage/workflow
+- current `bronze-builder` usage/workflow
 - testing and quality checks
 - runtime configuration notes
 - known limitations

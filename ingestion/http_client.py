@@ -3,42 +3,40 @@
 from __future__ import annotations
 
 import json
-import os
 import time
+from dataclasses import dataclass
+from functools import lru_cache
 from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import urlopen
+
+from ingestion.config import config_float, config_int, config_section, load_config
 
 
 class HttpClientError(RuntimeError):
     """Raised when HTTP requests fail."""
 
 
-def _env_float(name: str, default: float) -> float:
-    """Read float environment variable with fallback."""
+@dataclass(frozen=True)
+class HttpRequestConfig:
+    """Resolved HTTP retry and timeout settings."""
 
-    raw = os.getenv(name)
-    if raw is None:
-        return default
-    try:
-        value = float(raw)
-    except ValueError:
-        return default
-    return value if value > 0 else default
+    timeout_s: float
+    max_retries: int
+    retry_backoff_s: float
 
 
-def _env_int(name: str, default: int) -> int:
-    """Read integer environment variable with fallback."""
+@lru_cache(maxsize=1)
+def default_http_request_config() -> HttpRequestConfig:
+    """Load default HTTP settings once per process."""
 
-    raw = os.getenv(name)
-    if raw is None:
-        return default
-    try:
-        value = int(raw)
-    except ValueError:
-        return default
-    return value if value >= 0 else default
+    http_config = config_section(load_config(), "http")
+    return HttpRequestConfig(
+        timeout_s=config_float(http_config, "timeout_s", 15.0),
+        max_retries=config_int(http_config, "max_retries", 3),
+        retry_backoff_s=config_float(http_config, "retry_backoff_s", 1.0),
+    )
 
 
 def _retry_sleep(attempt: int, backoff_s: float) -> None:
@@ -78,9 +76,10 @@ def get_json(
 
     query = urlencode(params or {})
     request_url = f"{url}?{query}" if query else url
-    timeout_value = timeout_s if timeout_s is not None else _env_float("L2_HTTP_TIMEOUT_S", 15.0)
-    retries = max_retries if max_retries is not None else _env_int("L2_HTTP_MAX_RETRIES", 3)
-    backoff = retry_backoff_s if retry_backoff_s is not None else _env_float("L2_HTTP_RETRY_BACKOFF_S", 1.0)
+    defaults = default_http_request_config()
+    timeout_value = timeout_s if timeout_s is not None else defaults.timeout_s
+    retries = max_retries if max_retries is not None else defaults.max_retries
+    backoff = retry_backoff_s if retry_backoff_s is not None else defaults.retry_backoff_s
 
     for attempt in range(retries + 1):
         try:

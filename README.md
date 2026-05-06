@@ -2,49 +2,57 @@
 
 ## Project Overview
 
-`crypto-l2-loader` is a focused Deribit Level 2 order book ingestion tool. It collects bounded public order book snapshots, normalizes them into typed `L2Snapshot` records, aggregates valid snapshots into one-minute (`M1`) microstructure bars, and can persist those bars to a local Parquet lake.
+`crypto-l2-loader` is a focused Deribit Level 2 order book ingestion tool. It collects bounded public order book snapshots, normalizes them into typed `L2Snapshot` records, and persists raw snapshots to a local bronze Parquet lake.
+It also includes a Polars-based Bronze-to-Silver transform for fixed-width L2 snapshot feature rows.
 
 Current scope is intentionally narrow:
 
 - Fetch Deribit perpetual L2 order book snapshots through the public REST API.
 - Poll multiple symbols concurrently with bounded runtime controls.
-- Aggregate valid, non-crossed snapshots into M1 microstructure feature rows.
-- Optionally persist aggregated M1 rows to idempotent Parquet partitions.
-- Expose one CLI command: `loader-l2-m1`.
+- Optionally persist raw snapshots to idempotent daily bronze Parquet partitions.
+- Expose ingestion and transform CLI commands: `bronze-builder` and `silver-builder`.
 - Validate symbol aliases before scheduled jobs with `validate-symbols`.
 
-Former OHLCV, standalone open-interest, standalone funding, plotting, research-report, and database-ingestion surfaces have been removed.
+Former OHLCV, M1 aggregation, standalone open-interest, standalone funding, plotting, research-report, and database-ingestion surfaces have been removed.
 
 ## Architecture
 
 ```text
 CLI
-  -> Runtime config, env, and process lock
+  -> Runtime config and process lock
   -> Async multi-symbol L2 polling
   -> Deribit public/get_order_book adapter
   -> L2Snapshot normalization
-  -> M1 microstructure aggregation
+  -> Optional raw bronze Parquet lake writer
   -> JSON run output and structured logs
-  -> Optional Parquet lake writer
 
 CLI (validate-symbols)
   -> Symbol alias normalization
   -> Shallow Deribit order book fetch
   -> Valid book report
+
+Lake transform
+  -> silver-builder CLI command
+  -> Polars Bronze-to-Silver snapshot feature transform
+  -> Monthly silver Parquet feature partitions
 ```
 
 Current top-level code layout:
 
 ```text
 api/
+  constants.py  # shared command names and runtime artifact names
   cli.py        # CLI parser, run orchestration, output shaping
-  runtime.py    # .env loading, logging, process lock, concurrency config
+  runtime.py    # logging, process lock, concurrency config
 ingestion/
+  config.py
   http_client.py
   l2.py
   lake.py
+  silver.py
   exchanges/deribit_l2.py
 tests/
+config.yaml
 main.py
 pyproject.toml
 README.md
@@ -68,35 +76,50 @@ pip install -e ".[dev]"
 
 For runtime-only installs, use `pip install -e .`. The `dev` extra installs the pinned quality-gate tools used by `make check`.
 
+### Package Dependencies
+
+Runtime dependencies are declared in `pyproject.toml`:
+
+| Package | Used For |
+|---|---|
+| `pyarrow` | Bronze and Silver Parquet file reads/writes. |
+| `polars` | Bronze-to-Silver L2 feature transformations. |
+
+Development dependencies are grouped under the `dev` extra and cover `pytest`, `ruff`, and `mypy`.
+
 ## Configuration
 
-Copy `.env.example` to `.env` for local runtime configuration. `.env` is ignored by git.
+Runtime defaults live in tracked `config.yaml`. CLI options override these defaults for a single run.
+HTTP defaults are resolved once per process so each request does not reread `config.yaml`.
 
-Supported environment variables:
+Supported config keys:
 
-| Variable | Purpose |
+| Key | Purpose |
 |---|---|
-| `L2_HTTP_TIMEOUT_S` | HTTP request timeout in seconds. |
-| `L2_HTTP_MAX_RETRIES` | Retry count for transient request failures. |
-| `L2_HTTP_RETRY_BACKOFF_S` | Base retry backoff in seconds. |
-| `L2_SYNC_LOG_DIR` | Runtime log directory. |
-| `L2_FETCH_CONCURRENCY` | Maximum concurrent symbol fetches per polling tick. |
-| `L2_INGEST_EXCHANGE` | Exchange name. Currently only `deribit`. |
-| `L2_INGEST_SYMBOLS` | Whitespace- or comma-delimited symbol list. |
-| `L2_INGEST_LEVELS` | Requested order book depth per side. |
-| `L2_INGEST_SNAPSHOT_COUNT` | Number of polling ticks per symbol. |
-| `L2_INGEST_POLL_INTERVAL_S` | Sleep interval between polling ticks. |
-| `L2_INGEST_MAX_RUNTIME_S` | Optional runtime budget. `0` disables the budget. |
-| `L2_INGEST_SAVE_PARQUET_LAKE` | Save aggregated M1 bars when true. |
-| `L2_INGEST_LAKE_ROOT` | Parquet lake root directory. |
-| `L2_INGEST_NO_JSON_OUTPUT` | Suppress CLI JSON output when true. |
+| `http.timeout_s` | HTTP request timeout in seconds. Defaults to `8`. |
+| `http.max_retries` | Retry count for transient request failures. Defaults to `2`. |
+| `http.retry_backoff_s` | Base retry backoff in seconds. Defaults to `1`. |
+| `runtime.log_dir` | Runtime log directory. Defaults to repo-local `.logs/`. |
+| `runtime.log_rotation_days` | Log rotation interval in days. Defaults to `7` for weekly rotation. |
+| `runtime.log_backup_count` | Number of rotated logs to delete after. `0` keeps older logs indefinitely. |
+| `runtime.fetch_concurrency` | Maximum concurrent symbol fetches per polling tick. |
+| `ingestion.exchange` | Exchange name. Currently only `deribit`. |
+| `ingestion.symbols` | Symbol list. |
+| `ingestion.levels` | Requested order book depth per side. |
+| `ingestion.snapshot_count` | Number of polling ticks per symbol. Defaults to `5`. |
+| `ingestion.poll_interval_s` | Sleep interval between polling ticks. Defaults to `10` seconds. |
+| `ingestion.max_runtime_s` | Optional runtime budget. Defaults to `50` seconds. `0` disables the budget. |
+| `ingestion.save_parquet_lake` | Save raw L2 snapshots to the bronze Parquet lake when true. |
+| `ingestion.lake_root` | Parquet lake root directory. |
+| `ingestion.silver_lake_root` | Silver Parquet lake root directory. Defaults to `lake/silver`. |
+| `ingestion.json_output` | Print CLI JSON output when true. |
 
 ## Usage
 
-### CLI Options
+### Bronze Builder
 
 ```text
-python main.py loader-l2-m1 [options]
+python main.py bronze-builder [options]
 ```
 
 | Option | Meaning |
@@ -104,8 +127,8 @@ python main.py loader-l2-m1 [options]
 | `--exchange {deribit}` | Exchange adapter to use. Only `deribit` is currently supported. |
 | `--symbols SYMBOLS [SYMBOLS ...]` | Symbols to fetch. Accepts space-separated or comma-separated values. |
 | `--levels LEVELS` | Number of order book levels per side. |
-| `--snapshot-count SNAPSHOT_COUNT` | Polling ticks per symbol. |
-| `--poll-interval-s POLL_INTERVAL_S` | Sleep interval between polling ticks. |
+| `--snapshot-count SNAPSHOT_COUNT` | Polling ticks per symbol. Defaults to `5`. |
+| `--poll-interval-s POLL_INTERVAL_S` | Sleep interval between polling ticks. Defaults to `10` seconds. |
 | `--lake-root LAKE_ROOT` | Root directory for optional Parquet output. |
 | `--max-runtime-s MAX_RUNTIME_S` | Runtime budget in seconds. `0` disables the budget. |
 | `--save-parquet-lake`, `--no-save-parquet-lake` | Enable or disable Parquet persistence. |
@@ -114,28 +137,58 @@ python main.py loader-l2-m1 [options]
 Symbols are normalized to Deribit perpetual instruments. For example, `BTC`, `BTCUSDT`, `BTCUSD`, and `BTC-PERPETUAL` resolve to `BTC-PERPETUAL`.
 `SOL` resolves to Deribit's active `SOL_USDC-PERPETUAL` market.
 
-Fetch BTC and ETH snapshots, aggregate to M1 bars, and print JSON:
+Fetch BTC, ETH, and SOL snapshots at the default cadence of five polling ticks per run and print JSON:
 
 ```bash
-python main.py loader-l2-m1 --symbols BTC ETH --snapshot-count 60 --poll-interval-s 1
+python main.py bronze-builder --symbols BTC ETH SOL
 ```
 
 Comma-separated symbols are also accepted:
 
 ```bash
-python main.py loader-l2-m1 --symbols BTC,ETH --snapshot-count 60 --poll-interval-s 1
+python main.py bronze-builder --symbols BTC,ETH,SOL
 ```
 
-Save aggregated bars to the Parquet lake:
+Save raw snapshots to the bronze Parquet lake:
 
 ```bash
-python main.py loader-l2-m1 \
-  --symbols BTC ETH \
+python main.py bronze-builder \
+  --symbols BTC ETH SOL \
   --levels 50 \
-  --snapshot-count 60 \
-  --poll-interval-s 1 \
   --save-parquet-lake
 ```
+
+With the defaults, each run collects five raw snapshots per symbol with a 50-second runtime budget. Bronze persistence appends those snapshots as distinct parquet rows in the symbol's daily partition; it does not aggregate them.
+
+Runtime logs are written under `.logs/` by default, for example `.logs/bronze-builder.log`. The directory is ignored by git. Logs rotate weekly and `runtime.log_backup_count: 0` keeps older rotated logs.
+
+### Silver Builder
+
+```text
+python main.py silver-builder [options]
+```
+
+| Option | Meaning |
+|---|---|
+| `--bronze-lake-root BRONZE_LAKE_ROOT` | Root directory for bronze Parquet input files. Defaults to `lake/bronze`. |
+| `--silver-lake-root SILVER_LAKE_ROOT` | Root directory for silver Parquet output files. Defaults to `lake/silver`. |
+| `--depth DEPTH` | Expected book depth used for fixed-width Silver arrays. Defaults to `50`. |
+| `--json-output`, `--no-json-output` | Enable or suppress JSON output. Logs are still emitted. |
+
+Transform Bronze L2 snapshots into monthly Silver snapshot feature partitions:
+
+```bash
+python main.py silver-builder
+```
+
+Cron example for the Bronze and Silver jobs:
+
+```cron
+* * * * * cd /home/vcs/git/crypto-l2-loader && .venv/bin/python main.py bronze-builder --symbols BTC ETH SOL
+* * * * * cd /home/vcs/git/crypto-l2-loader && .venv/bin/python main.py silver-builder
+```
+
+The Silver job logs to `.logs/silver-builder.log` by default and uses `/tmp/crypto-l2-loader-silver-builder.lock` to avoid overlapping transforms.
 
 Validate symbols before adding them to cron:
 
@@ -147,25 +200,42 @@ The Parquet layout is:
 
 ```text
 lake/bronze/
-  dataset_type=l2_m1/
+  dataset_type=l2_snapshot/
     exchange=deribit/
       instrument_type=perp/
         symbol=BTC-PERPETUAL/
-          timeframe=1m/
-            date=YYYY-MM/
-              data.parquet
+          depth=50/
+            source=rest_order_book/
+              month=YYYY-MM/
+                date=YYYY-MM-DD/
+                  data.parquet
+```
+
+The Silver Parquet layout is monthly to avoid unnecessary small-file fragmentation:
+
+```text
+lake/silver/
+  dataset_type=l2_snapshot_features/
+    exchange=deribit/
+      instrument_type=perp/
+        symbol=BTC-PERPETUAL/
+          month=YYYY-MM/
+            data.parquet
 ```
 
 ## Modules
 
 | Module | Responsibility |
 |---|---|
-| `api/cli.py` | CLI parsing, L2 run orchestration, aggregation coordination, JSON output, parquet persistence dispatch, and run logging. |
-| `api/runtime.py` | `.env` loading, process locking, logging setup, and concurrency config. |
-| `ingestion/http_client.py` | Minimal JSON HTTP client with retries. |
+| `api/constants.py` | Shared command names and runtime artifact paths. |
+| `api/cli.py` | CLI parsing, bronze-builder orchestration, JSON output, parquet persistence dispatch, and run logging. |
+| `api/runtime.py` | Process locking, logging setup, and concurrency config. |
+| `ingestion/config.py` | Deterministic `config.yaml` loading and typed config accessors. |
+| `ingestion/http_client.py` | Minimal JSON HTTP client with retries and cached per-process default settings. |
 | `ingestion/exchanges/deribit_l2.py` | Deribit order book adapter and symbol normalization. |
-| `ingestion/l2.py` | L2 dataclasses, async polling, snapshot normalization, and M1 feature aggregation. |
-| `ingestion/lake.py` | Idempotent Parquet writer for aggregated L2 M1 bars. |
+| `ingestion/l2.py` | L2 dataclasses, async polling, and snapshot normalization. |
+| `ingestion/lake.py` | Idempotent Parquet writer for raw L2 snapshots. |
+| `ingestion/silver.py` | Polars Bronze-to-Silver transform and monthly Silver feature writer. |
 
 ## Data Dictionary
 
@@ -180,73 +250,38 @@ lake/bronze/
 | `open_interest` | Deribit open interest value included in the order book response. |
 | `funding_8h`, `current_funding` | Deribit funding fields included in the order book response. |
 
-`L2MinuteBar` captures one generated 1-minute aggregation row per exchange, symbol, and minute. Only valid snapshots with a non-empty, non-crossed best book are included; crossed books, empty books, and non-positive best prices are dropped before aggregation.
-
-Snapshot-level formulas used by the 1m aggregator:
-
-| Formula | Meaning |
-|---|---|
-| `mid = (best_bid + best_ask) / 2` | Best bid/ask midpoint. |
-| `spread_bps = ((best_ask - best_bid) / mid) * 10000` | Quoted spread in basis points. |
-| `bid_depth_N`, `ask_depth_N` | Sum of side amounts through the first `N` book levels. |
-| `imbalance_N = (bid_depth_N - ask_depth_N) / (bid_depth_N + ask_depth_N)` | Signed depth imbalance. Positive values indicate more bid depth; negative values indicate more ask depth. `None` when both sides have zero depth. |
-| `microprice = ((best_ask * bid_amount_1) + (best_bid * ask_amount_1)) / (bid_amount_1 + ask_amount_1)` | L1 queue-weighted price. `None` when total L1 amount is zero. |
-| `microprice_minus_mid = microprice - mid` | L1 microprice displacement from midpoint. |
-| `side_vwap_10 = sum(price * amount) / sum(amount)` | Side-specific VWAP through the first 10 book levels. `None` when the side has zero depth. |
-
-Generated 1m aggregation fields:
-
-| Field | Meaning |
-|---|---|
-| `minute_ts` | UTC minute bucket start. Snapshots are grouped by `timestamp` truncated to the minute. |
-| `exchange` | Source exchange name. Currently `deribit`. |
-| `symbol` | Normalized exchange instrument symbol, for example `BTC-PERPETUAL`. |
-| `snapshot_count` | Number of valid snapshots included in the minute row. |
-| `mid_open` | First snapshot midpoint in timestamp order within the minute. |
-| `mid_high` | Maximum snapshot midpoint within the minute. |
-| `mid_low` | Minimum snapshot midpoint within the minute. |
-| `mid_close` | Last snapshot midpoint in timestamp order within the minute. |
-| `mark_close` | Mark price from the last included snapshot, when Deribit provides it. |
-| `index_close` | Index price from the last included snapshot, when Deribit provides it. |
-| `spread_bps_mean` | Arithmetic mean of snapshot `spread_bps` values within the minute. |
-| `spread_bps_max` | Maximum snapshot `spread_bps` within the minute. |
-| `spread_bps_last` | Last snapshot `spread_bps` in timestamp order within the minute. |
-| `bid_depth_1_mean` | Mean bid amount at the best bid level. |
-| `ask_depth_1_mean` | Mean ask amount at the best ask level. |
-| `bid_depth_10_mean` | Mean cumulative bid amount through the first 10 bid levels. |
-| `ask_depth_10_mean` | Mean cumulative ask amount through the first 10 ask levels. |
-| `bid_depth_50_mean` | Mean cumulative bid amount through the first 50 bid levels. If fewer levels are present, all available levels are summed. |
-| `ask_depth_50_mean` | Mean cumulative ask amount through the first 50 ask levels. If fewer levels are present, all available levels are summed. |
-| `imbalance_1_mean` | Mean L1 depth imbalance across snapshots with a defined L1 imbalance. |
-| `imbalance_10_mean` | Mean 10-level depth imbalance across snapshots with a defined 10-level imbalance. |
-| `imbalance_50_mean` | Mean 50-level depth imbalance across snapshots with a defined 50-level imbalance. |
-| `imbalance_10_last` | Last 10-level depth imbalance in timestamp order within the minute. |
-| `imbalance_50_last` | Last 50-level depth imbalance in timestamp order within the minute. |
-| `microprice_close` | Last L1 microprice in timestamp order within the minute. |
-| `microprice_minus_mid_mean` | Mean L1 microprice displacement from midpoint across snapshots with a defined microprice. |
-| `bid_vwap_10_mean` | Mean bid-side VWAP through the first 10 bid levels across snapshots with defined bid VWAP. |
-| `ask_vwap_10_mean` | Mean ask-side VWAP through the first 10 ask levels across snapshots with defined ask VWAP. |
-| `open_interest_last` | Open interest from the last included snapshot, when Deribit provides it. |
-| `funding_8h_last` | 8-hour funding field from the last included snapshot, when Deribit provides it. |
-| `current_funding_last` | Current funding field from the last included snapshot, when Deribit provides it. |
-| `fetch_duration_s_mean` | Mean wall-clock fetch duration for included snapshots, in seconds. |
-| `fetch_duration_s_max` | Maximum wall-clock fetch duration for included snapshots, in seconds. |
-| `fetch_duration_s_last` | Last included snapshot fetch duration, in seconds. |
-
-Parquet rows are produced from `L2MinuteBar` with additional lake metadata:
+Bronze Parquet rows are produced from `L2Snapshot` with additional lake metadata:
 
 | Field | Meaning |
 |---|---|
 | `schema_version` | Parquet row schema version. Currently `v1`. |
-| `dataset_type` | Dataset identifier. Currently `l2_m1`. |
+| `dataset_type` | Dataset identifier. Currently `l2_snapshot`. |
 | `instrument_type` | Instrument category. Currently `perp`. |
-| `event_time` | Same timestamp as `minute_ts`; the canonical event time for the row. |
+| `event_time` | Snapshot exchange timestamp. |
 | `ingested_at` | UTC timestamp when the row was prepared for lake persistence. |
 | `run_id` | Unique CLI run identifier assigned during ingestion. |
-| `source_endpoint` | Logical source endpoint name. Currently `public_l2_orderbook`. |
-| `open_time` | Inclusive 1m interval start, equal to `minute_ts`. |
-| `close_time` | 1m interval close marker, set to `minute_ts` plus `59.999` seconds. |
-| `timeframe` | Aggregation timeframe. Currently `1m`. |
+| `source` | Logical source name. Currently `rest_order_book`. |
+| `depth` | Requested order book depth per side, also used as a partition column. |
+| `bids`, `asks` | Raw normalized price/amount levels. |
+
+Silver L2 snapshot feature rows are derived from Bronze with Polars:
+
+| Field | Meaning |
+|---|---|
+| `schema_version` | Silver feature schema version. Currently `v1`. |
+| `dataset_type` | Dataset identifier. Currently `l2_snapshot_features`. |
+| `ts_event` | Exchange event timestamp from the Bronze snapshot. |
+| `ts_received` | Bronze ingestion timestamp used as the received-time fallback. |
+| `exchange`, `symbol`, `instrument_type`, `source`, `run_id`, `depth` | Source and run identity. |
+| `month` | Monthly partition key derived from `ts_event`. |
+| `mid_price`, `spread`, `spread_bps` | Top-of-book price features. |
+| `best_bid_price`, `best_bid_size`, `best_ask_price`, `best_ask_size` | Best quote features. |
+| `bid_prices`, `bid_sizes`, `ask_prices`, `ask_sizes` | Fixed-width depth arrays padded with nulls to `depth`. |
+| `bid_volume_N`, `ask_volume_N` | Cumulative size for depth windows `1`, `5`, `10`, `20`, and `50`. |
+| `imbalance_N` | `(bid_volume_N - ask_volume_N) / (bid_volume_N + ask_volume_N)` for each depth window. |
+| `microprice` | Top-of-book size-weighted microprice. |
+| `mark_price`, `index_price`, `open_interest`, `funding_rate`, `funding_8h` | Deribit market fields carried into Silver. |
+| `is_valid`, `validation_flags` | Deterministic book validation status and reason flags. |
 
 ## Testing
 
@@ -268,14 +303,12 @@ make check
 
 - Only Deribit perpetual L2 order book snapshots are supported.
 - The loader uses REST polling, not a streaming websocket feed.
-- M1 bars are computed from the snapshots collected during a run; they are not full exchange-native historical bars.
 - Parquet persistence is local-file based and does not include a database sink.
-- Raw snapshots are not persisted; only aggregated M1 bars are written.
 - Failed per-symbol fetches inside a polling tick are logged, isolated, and skipped for that tick.
 
 ## Future Improvements
 
 - Add a websocket collector for higher-frequency L2 sampling.
 - Add explicit schema-version migration tests for Parquet outputs.
-- Add replay utilities for validating aggregation behavior on stored raw snapshots.
+- Add replay utilities for validating stored raw snapshots.
 - Add exchange adapters behind the existing L2 interfaces.

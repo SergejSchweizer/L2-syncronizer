@@ -1,4 +1,4 @@
-"""Runtime helpers for CLI locking, logging, and environment tuning."""
+"""Runtime helpers for CLI locking and logging."""
 
 from __future__ import annotations
 
@@ -8,85 +8,13 @@ import os
 from logging.handlers import TimedRotatingFileHandler
 from pathlib import Path
 
+from ingestion.config import Config, config_int, config_section, config_str, load_config
+
 LOGGER_NAME = "crypto_l2_loader"
-DEFAULT_LOG_DIR = "/volume1/Temp/logs"
+DEFAULT_LOG_DIR = ".logs"
+DEFAULT_LOG_ROTATION_DAYS = 7
+DEFAULT_LOG_BACKUP_COUNT = 0
 DEFAULT_FETCH_CONCURRENCY = 8
-
-
-def load_env_file(path: str = ".env") -> None:
-    """Load simple KEY=VALUE pairs from a local environment file."""
-
-    env_path = Path(path)
-    if not env_path.exists():
-        return
-
-    for raw_line in env_path.read_text(encoding="utf-8").splitlines():
-        line = raw_line.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        key, value = line.split("=", 1)
-        key = key.strip()
-        if not key or key in os.environ:
-            continue
-        os.environ[key] = _strip_env_quotes(value.strip())
-
-
-def _strip_env_quotes(value: str) -> str:
-    """Remove matching single or double quotes from an env value."""
-
-    if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
-        return value[1:-1]
-    return value
-
-
-def env_bool(name: str, default: bool) -> bool:
-    """Read a boolean environment variable with fallback."""
-
-    raw = os.getenv(name)
-    if raw is None:
-        return default
-    return raw.strip().lower() in {"1", "true", "yes", "y", "on"}
-
-
-def env_float(name: str, default: float) -> float:
-    """Read a float environment variable with fallback."""
-
-    raw = os.getenv(name)
-    if raw is None:
-        return default
-    try:
-        return float(raw)
-    except ValueError:
-        return default
-
-
-def env_int(name: str, default: int) -> int:
-    """Read an integer environment variable with fallback."""
-
-    raw = os.getenv(name)
-    if raw is None:
-        return default
-    try:
-        return int(raw)
-    except ValueError:
-        return default
-
-
-def env_list(name: str, default: list[str]) -> list[str]:
-    """Read a whitespace or comma-delimited string list from the environment."""
-
-    raw = os.getenv(name)
-    if raw is None:
-        return default
-    normalized = raw.replace(",", " ")
-    values = [item.strip() for item in normalized.split() if item.strip()]
-    return values or default
-
-
-def env_str(name: str, default: str) -> str:
-    """Read a string environment variable with fallback."""
-
-    return os.getenv(name, default)
 
 
 class SingleInstanceError(RuntimeError):
@@ -98,7 +26,7 @@ class SingleInstanceLock:
 
     Example:
         ```python
-        with SingleInstanceLock(".run/crypto-l2-loader-l2.lock"):
+        with SingleInstanceLock("/tmp/crypto-l2-loader-bronze-builder.lock"):
             run_loader()
         ```
     """
@@ -135,7 +63,7 @@ def _safe_log_module_name(module_name: str) -> str:
     return normalized or "crypto-l2-loader"
 
 
-def configure_logging(module_name: str = "crypto-l2-loader") -> logging.Logger:
+def configure_logging(module_name: str = "crypto-l2-loader", config: Config | None = None) -> logging.Logger:
     """Configure module-specific file logging with weekly rotation."""
 
     safe_module_name = _safe_log_module_name(module_name)
@@ -146,14 +74,17 @@ def configure_logging(module_name: str = "crypto-l2-loader") -> logging.Logger:
     logger.setLevel(logging.INFO)
     logger.propagate = False
     formatter = logging.Formatter("%(asctime)s %(levelname)s %(message)s")
-    log_dir = Path(os.getenv("L2_SYNC_LOG_DIR", DEFAULT_LOG_DIR))
+    runtime_config = config_section(config or load_config(), "runtime")
+    log_dir = Path(config_str(runtime_config, "log_dir", DEFAULT_LOG_DIR))
+    rotation_days = max(1, config_int(runtime_config, "log_rotation_days", DEFAULT_LOG_ROTATION_DAYS))
+    backup_count = max(0, config_int(runtime_config, "log_backup_count", DEFAULT_LOG_BACKUP_COUNT))
     try:
         log_dir.mkdir(parents=True, exist_ok=True)
         file_handler = TimedRotatingFileHandler(
             filename=log_dir / f"{safe_module_name}.log",
             when="D",
-            interval=7,
-            backupCount=0,
+            interval=rotation_days,
+            backupCount=backup_count,
             encoding="utf-8",
             utc=True,
         )
@@ -170,12 +101,9 @@ def configure_logging(module_name: str = "crypto-l2-loader") -> logging.Logger:
     return logger
 
 
-def fetch_concurrency() -> int:
-    """Return bounded fetch concurrency from environment."""
+def fetch_concurrency(config: Config | None = None) -> int:
+    """Return bounded fetch concurrency from config."""
 
-    raw = os.getenv("L2_FETCH_CONCURRENCY", str(DEFAULT_FETCH_CONCURRENCY))
-    try:
-        value = int(raw)
-    except ValueError:
-        return DEFAULT_FETCH_CONCURRENCY
+    runtime_config = config_section(config or load_config(), "runtime")
+    value = config_int(runtime_config, "fetch_concurrency", DEFAULT_FETCH_CONCURRENCY)
     return max(1, value)

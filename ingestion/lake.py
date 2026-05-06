@@ -1,4 +1,4 @@
-"""Parquet lake writer for aggregated L2 minute bars."""
+"""Parquet lake writer for raw L2 snapshots."""
 
 from __future__ import annotations
 
@@ -8,10 +8,14 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import cast
 
-from ingestion.l2 import L2MinuteBar, l2_m1_partition_key, l2_m1_record
+from ingestion.l2 import (
+    L2Snapshot,
+    l2_snapshot_partition_key,
+    l2_snapshot_record,
+)
 
-PartitionKey = tuple[str, str, str, str, str]
-NaturalKey = tuple[str, str, str, str, datetime]
+SnapshotPartitionKey = tuple[str, str, str, int, str, str, str]
+SnapshotNaturalKey = tuple[str, str, str, int, str, datetime]
 
 
 def utc_run_id() -> str:
@@ -20,58 +24,63 @@ def utc_run_id() -> str:
     return datetime.now(UTC).strftime("%Y%m%dT%H%M%S%fZ")
 
 
-def partition_path(lake_root: str, dataset_type: str, key: PartitionKey) -> Path:
-    """Return the destination directory for one parquet partition."""
+def snapshot_partition_path(lake_root: str, key: SnapshotPartitionKey) -> Path:
+    """Return the bronze destination directory for one raw L2 snapshot partition."""
 
-    exchange, instrument_type, symbol, timeframe, date_partition = key
+    exchange, instrument_type, symbol, depth, source, month_partition, date_partition = key
     return (
         Path(lake_root)
-        / f"dataset_type={dataset_type}"
+        / "dataset_type=l2_snapshot"
         / f"exchange={exchange}"
         / f"instrument_type={instrument_type}"
         / f"symbol={symbol}"
-        / f"timeframe={timeframe}"
+        / f"depth={depth}"
+        / f"source={source}"
+        / f"month={month_partition}"
         / f"date={date_partition}"
     )
 
 
-def record_natural_key(record: dict[str, object]) -> NaturalKey:
-    """Build the idempotent natural key for one L2 parquet row."""
+def snapshot_record_natural_key(record: dict[str, object]) -> SnapshotNaturalKey:
+    """Build the idempotent natural key for one raw L2 snapshot row."""
 
-    open_time = record["open_time"]
-    if not isinstance(open_time, datetime):
-        raise ValueError("open_time must be datetime")
+    event_time = record["event_time"]
+    if not isinstance(event_time, datetime):
+        raise ValueError("event_time must be datetime")
     return (
         str(record["exchange"]),
         str(record["instrument_type"]),
         str(record["symbol"]),
-        str(record["timeframe"]),
-        open_time,
+        int(cast(int, record["depth"])),
+        str(record["source"]),
+        event_time,
     )
 
 
-def merge_and_deduplicate_rows(
+def merge_and_deduplicate_snapshot_rows(
     existing: list[dict[str, object]],
     new: list[dict[str, object]],
 ) -> list[dict[str, object]]:
-    """Merge old and new rows while keeping the latest row for duplicate keys."""
+    """Merge old and new raw snapshot rows while keeping the latest duplicate key."""
 
-    merged: dict[NaturalKey, dict[str, object]] = {}
+    merged: dict[SnapshotNaturalKey, dict[str, object]] = {}
     for record in existing:
-        merged[record_natural_key(record)] = record
+        merged[snapshot_record_natural_key(record)] = record
     for record in new:
-        merged[record_natural_key(record)] = record
+        merged[snapshot_record_natural_key(record)] = record
 
     rows = list(merged.values())
-    rows.sort(key=lambda item: cast(datetime, item["open_time"]))
+    rows.sort(key=lambda item: cast(datetime, item["event_time"]))
     return rows
 
 
-def save_l2_m1_parquet_lake(
-    rows_by_exchange: dict[str, dict[str, list[L2MinuteBar]]],
+def save_l2_snapshot_parquet_lake(
+    snapshots_by_symbol: dict[str, list[L2Snapshot]],
     lake_root: str,
+    depth: int,
+    source: str = "rest_order_book",
 ) -> list[str]:
-    """Save aggregated L2 M1 rows to parquet lake partitions."""
+    """Save raw L2 snapshots to daily bronze parquet lake partitions."""
 
     try:
         import pyarrow as pa
@@ -81,17 +90,23 @@ def save_l2_m1_parquet_lake(
 
     run_id = utc_run_id()
     ingested_at = datetime.now(UTC)
-    dataset_type = "l2_m1"
 
-    grouped: defaultdict[PartitionKey, list[dict[str, object]]] = defaultdict(list)
-    for symbol_map in rows_by_exchange.values():
-        for rows in symbol_map.values():
-            for row in rows:
-                key = l2_m1_partition_key(row)
-                grouped[key].append(l2_m1_record(row=row, run_id=run_id, ingested_at=ingested_at))
+    grouped: defaultdict[SnapshotPartitionKey, list[dict[str, object]]] = defaultdict(list)
+    for snapshots in snapshots_by_symbol.values():
+        for snapshot in snapshots:
+            key = l2_snapshot_partition_key(snapshot=snapshot, depth=depth, source=source)
+            grouped[key].append(
+                l2_snapshot_record(
+                    snapshot=snapshot,
+                    depth=depth,
+                    run_id=run_id,
+                    ingested_at=ingested_at,
+                    source=source,
+                )
+            )
 
-    def _write_one_partition(key: PartitionKey, rows: list[dict[str, object]]) -> str:
-        part_dir = partition_path(lake_root=lake_root, dataset_type=dataset_type, key=key)
+    def _write_one_partition(key: SnapshotPartitionKey, rows: list[dict[str, object]]) -> str:
+        part_dir = snapshot_partition_path(lake_root=lake_root, key=key)
         part_dir.mkdir(parents=True, exist_ok=True)
         file_path = part_dir / "data.parquet"
         staging_path = part_dir / f".staging-{run_id}.parquet"
@@ -101,7 +116,7 @@ def save_l2_m1_parquet_lake(
             existing_table = pq.ParquetFile(file_path).read()  # type: ignore[no-untyped-call]
             existing_rows = existing_table.to_pylist()
 
-        merged_rows = merge_and_deduplicate_rows(existing=existing_rows, new=rows)
+        merged_rows = merge_and_deduplicate_snapshot_rows(existing=existing_rows, new=rows)
         table = pa.Table.from_pylist(merged_rows)
         pq.write_table(table, staging_path)  # type: ignore[no-untyped-call]
         staging_path.replace(file_path)
