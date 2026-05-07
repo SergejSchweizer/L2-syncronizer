@@ -6,18 +6,23 @@ import hashlib
 import json
 import math
 import subprocess
-from datetime import UTC, datetime
+from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
 import polars as pl
 
 GOLD_FEATURE_SET_VERSION = "gold_l2_m1_v1"
+GOLD_L2_M1_DATASET_TYPE = "l2_m1_features"
+GOLD_TIMEFRAME = "1m"
+GOLD_PLOT_MAX_POINTS = 3000
 EXPECTED_SNAPSHOTS_PER_MINUTE = 6
 COMPLETE_MINUTE_COVERAGE_THRESHOLD = 0.8
 DEPTH_WINDOWS = (1, 5, 10, 20, 50)
 
 GOLD_KEY_COLUMNS = ["ts_minute", "exchange", "symbol", "instrument_type", "depth", "feature_set_version"]
+GOLD_DATASET_PARTITION_COLUMNS = ["exchange", "instrument_type", "symbol", "depth", "feature_set_version"]
 GOLD_METADATA_COLUMNS = [
     "snapshot_count",
     "coverage_ratio",
@@ -67,6 +72,23 @@ GOLD_NUMERIC_FEATURES = [
 GOLD_COLUMNS = [*GOLD_KEY_COLUMNS, *GOLD_METADATA_COLUMNS, *GOLD_NUMERIC_FEATURES]
 
 
+@dataclass(frozen=True)
+class GoldDatasetIdentity:
+    """Partition identity for one full Gold timeframe dataset."""
+
+    exchange: str
+    instrument_type: str
+    symbol: str
+    depth: int
+    feature_set_version: str
+
+    @property
+    def base_symbol(self) -> str:
+        """Return the base-asset symbol used in Gold artifact filenames."""
+
+        return base_asset_symbol(self.symbol)
+
+
 def transform_l2_silver_to_gold(
     silver_lake_root: str,
     gold_lake_root: str,
@@ -106,6 +128,7 @@ def transform_l2_silver_to_gold(
         feature_set_version=feature_set_version,
         plot=plot,
         manifest=manifest,
+        densify=False,
     )
 
 
@@ -170,7 +193,7 @@ def gold_l2_m1_from_silver(
         pl.col("is_valid").not_().sum().alias("_invalid_snapshot_count"),
     )
 
-    return (
+    observed = (
         grouped.with_columns(
             (pl.col("coverage_ratio") >= completeness_threshold).alias("is_complete_minute"),
             _gold_quality_flags_expr(completeness_threshold=completeness_threshold),
@@ -178,6 +201,54 @@ def gold_l2_m1_from_silver(
         .select(GOLD_COLUMNS)
         .sort(["symbol", "ts_minute"])
     )
+    return densify_gold_m1_timeframe(observed)
+
+
+def densify_gold_m1_timeframe(gold: pl.DataFrame) -> pl.DataFrame:
+    """Insert explicit missing M1 rows from each dataset's first to last observed minute."""
+
+    if gold.is_empty():
+        return gold
+
+    dense_frames: list[pl.DataFrame] = []
+    for partition in gold.partition_by(GOLD_DATASET_PARTITION_COLUMNS):
+        identity = gold_dataset_identity(partition)
+        ts_min = partition["ts_minute"].min()
+        ts_max = partition["ts_minute"].max()
+        if not isinstance(ts_min, datetime) or not isinstance(ts_max, datetime):
+            dense_frames.append(partition)
+            continue
+
+        timeline = _minute_range(start=ts_min, end=ts_max)
+        scaffold = pl.DataFrame(
+            {
+                "ts_minute": timeline,
+                "exchange": [identity.exchange] * len(timeline),
+                "symbol": [identity.symbol] * len(timeline),
+                "instrument_type": [identity.instrument_type] * len(timeline),
+                "depth": [identity.depth] * len(timeline),
+                "feature_set_version": [identity.feature_set_version] * len(timeline),
+            }
+        )
+        dense = (
+            scaffold.join(partition, on=GOLD_KEY_COLUMNS, how="left")
+            .with_columns(pl.col("snapshot_count").is_null().alias("_is_missing_timeframe_row"))
+            .with_columns(
+                pl.col("snapshot_count").fill_null(0),
+                pl.col("coverage_ratio").fill_null(0.0),
+                pl.col("is_complete_minute").fill_null(False),
+                pl.when(pl.col("_is_missing_timeframe_row"))
+                .then(pl.lit(["missing_minute"]))
+                .otherwise(pl.col("quality_flags"))
+                .alias("quality_flags"),
+                *[pl.col(column).fill_null(float("nan")).alias(column) for column in GOLD_NUMERIC_FEATURES],
+            )
+            .drop("_is_missing_timeframe_row")
+            .select(GOLD_COLUMNS)
+        )
+        dense_frames.append(dense)
+
+    return pl.concat(dense_frames, how="vertical").sort(["symbol", "ts_minute"])
 
 
 def write_gold_l2_m1_artifacts(
@@ -190,32 +261,50 @@ def write_gold_l2_m1_artifacts(
     feature_set_version: str = GOLD_FEATURE_SET_VERSION,
     plot: bool = True,
     manifest: bool = True,
+    densify: bool = True,
 ) -> list[str]:
-    """Write per-base-symbol gold Parquet, JSON metadata, and PNG profile artifacts."""
+    """Write full versioned Gold datasets under lake-style timeframe leaves."""
 
     if gold.is_empty():
         return []
 
-    output_root = Path(gold_lake_root)
-    output_root.mkdir(parents=True, exist_ok=True)
+    if densify:
+        gold = densify_gold_m1_timeframe(gold)
     written_files: list[str] = []
 
-    for symbol_frame in gold.partition_by("symbol"):
-        symbol = str(symbol_frame["symbol"][0])
-        base_symbol = base_asset_symbol(symbol)
+    for symbol_frame in gold.partition_by(GOLD_DATASET_PARTITION_COLUMNS):
+        identity = gold_dataset_identity(symbol_frame)
+        source_symbol_summary = source_summary_for_symbol(source_summary, identity.symbol)
         hash_payload = {
-            "feature_set_version": feature_set_version,
+            "dataset_type": GOLD_L2_M1_DATASET_TYPE,
+            "feature_set_version": identity.feature_set_version,
+            "timeframe": GOLD_TIMEFRAME,
+            "exchange": identity.exchange,
+            "instrument_type": identity.instrument_type,
+            "symbol": identity.symbol,
+            "depth": identity.depth,
             "expected_snapshots_per_minute": expected_snapshots_per_minute,
             "completeness_threshold": completeness_threshold,
             "git_commit_hash": git_commit_hash,
-            "source_summary": source_summary_for_symbol(source_summary, symbol),
+            "source_summary": source_symbol_summary,
             "gold_schema": {name: str(dtype) for name, dtype in symbol_frame.schema.items()},
         }
         hash_string = stable_json_hash(hash_payload)
-        basename = f"{base_symbol}_L2_{hash_string}_{git_commit_hash[:12]}"
-        parquet_path = output_root / f"{basename}.parquet"
-        json_path = output_root / f"{basename}.json"
-        png_path = output_root / f"{basename}.png"
+        basename = f"{identity.base_symbol}_L2_{hash_string}_{git_commit_hash[:12]}"
+        dataset_dir = gold_l2_m1_dataset_path(
+            lake_root=gold_lake_root,
+            feature_set_version=identity.feature_set_version,
+            exchange=identity.exchange,
+            instrument_type=identity.instrument_type,
+            base_asset=identity.base_symbol,
+            symbol=identity.symbol,
+            depth=identity.depth,
+            timeframe=GOLD_TIMEFRAME,
+        )
+        dataset_dir.mkdir(parents=True, exist_ok=True)
+        parquet_path = dataset_dir / f"{basename}.parquet"
+        json_path = dataset_dir / f"{basename}.json"
+        png_path = dataset_dir / f"{basename}.png"
 
         symbol_frame.write_parquet(parquet_path)
         written_files.append(str(parquet_path.resolve()))
@@ -224,12 +313,12 @@ def write_gold_l2_m1_artifacts(
         if manifest or plot:
             metadata = gold_metadata(
                 gold=symbol_frame,
-                source_summary=source_summary_for_symbol(source_summary, symbol),
+                source_summary=source_symbol_summary,
                 hash_string=hash_string,
                 git_commit_hash=git_commit_hash,
                 expected_snapshots_per_minute=expected_snapshots_per_minute,
                 completeness_threshold=completeness_threshold,
-                feature_set_version=feature_set_version,
+                feature_set_version=identity.feature_set_version,
             )
 
         if manifest:
@@ -242,6 +331,47 @@ def write_gold_l2_m1_artifacts(
             written_files.append(str(png_path.resolve()))
 
     return sorted(written_files)
+
+
+def gold_l2_m1_dataset_path(
+    lake_root: str,
+    feature_set_version: str,
+    exchange: str,
+    instrument_type: str,
+    base_asset: str,
+    symbol: str,
+    depth: int,
+    timeframe: str = GOLD_TIMEFRAME,
+) -> Path:
+    """Return the Gold destination directory for one full versioned timeframe dataset."""
+
+    return (
+        Path(lake_root)
+        / f"dataset_type={GOLD_L2_M1_DATASET_TYPE}"
+        / f"feature_set_version={feature_set_version}"
+        / f"exchange={exchange}"
+        / f"instrument_type={instrument_type}"
+        / f"base_asset={base_asset}"
+        / f"symbol={symbol}"
+        / f"depth={depth}"
+        / f"timeframe={timeframe}"
+    )
+
+
+def gold_dataset_identity(gold: pl.DataFrame) -> GoldDatasetIdentity:
+    """Extract the Gold dataset identity from a non-empty partition frame."""
+
+    if gold.is_empty():
+        raise ValueError("gold dataset identity requires at least one row")
+
+    first = gold.row(0, named=True)
+    return GoldDatasetIdentity(
+        exchange=str(first["exchange"]),
+        instrument_type=str(first["instrument_type"]),
+        symbol=str(first["symbol"]),
+        depth=int(first["depth"]),
+        feature_set_version=str(first["feature_set_version"]),
+    )
 
 
 def silver_source_summary(silver: pl.DataFrame) -> dict[str, Any]:
@@ -278,16 +408,19 @@ def gold_metadata(
     timestamp_min = _scalar(gold["ts_minute"].min()) if "ts_minute" in gold.columns and gold.height else None
     timestamp_max = _scalar(gold["ts_minute"].max()) if "ts_minute" in gold.columns and gold.height else None
     return {
+        "dataset_type": GOLD_L2_M1_DATASET_TYPE,
         "hash_string": hash_string,
         "git_commit_hash": git_commit_hash,
         "build_timestamp_utc": datetime.now(UTC).isoformat(),
         "feature_set_version": feature_set_version,
+        "timeframe": GOLD_TIMEFRAME,
         "expected_snapshots_per_minute": expected_snapshots_per_minute,
         "completeness_threshold": completeness_threshold,
         "row_count": gold.height,
         "column_count": len(gold.columns),
         "timestamp_min": timestamp_min,
         "timestamp_max": timestamp_max,
+        "missing_minute_count": _missing_minute_count(gold),
         "source_silver_dataset_summaries": source_summary,
         "features": [_column_metadata(gold, column) for column in gold.columns],
     }
@@ -312,15 +445,33 @@ def write_gold_profile_png(gold: pl.DataFrame, metadata: dict[str, Any], path: P
         squeeze=False,
     )
     fig.patch.set_facecolor("#111217")
-    ts_values = gold["ts_minute"].to_list() if "ts_minute" in gold.columns else list(range(gold.height))
+    metadata_lines = gold_plot_metadata_lines(metadata=metadata, gold=gold)
+    fig.suptitle(metadata_lines[0], color="#eceff4", fontsize=12, y=0.997)
+    fig.text(
+        0.01,
+        0.982,
+        "\n".join(metadata_lines[1:]),
+        color="#d8dee9",
+        fontsize=8,
+        va="top",
+        family="monospace",
+    )
+    plot_gold = gold_plot_sample(gold=gold, max_points=GOLD_PLOT_MAX_POINTS)
+    ts_values = plot_gold["ts_minute"].to_list() if "ts_minute" in plot_gold.columns else list(range(plot_gold.height))
+    missing_ts_values = _missing_minute_timestamps(plot_gold)
+    feature_stats = gold_plot_feature_row_stats_map(gold=gold, features=numeric_features)
 
     legend = (
         f"{gold['symbol'][0] if gold.height else 'unknown'} | rows={metadata['row_count']} | "
+        f"missing={metadata.get('missing_minute_count', 0)} | "
+        f"plot_points={plot_gold.height}/{gold.height} | "
         f"{metadata['timestamp_min']} to {metadata['timestamp_max']} | hash={metadata['hash_string']}"
     )
     for index, feature in enumerate(numeric_features):
-        values = gold[feature].to_list()
-        clean_values = [value for value in values if isinstance(value, int | float) and math.isfinite(float(value))]
+        values = plot_gold[feature].to_list()
+        clean_values = [
+            value for value in gold[feature].to_list() if isinstance(value, int | float) and math.isfinite(float(value))
+        ]
         line_ax = axes[index][0]
         hist_ax = axes[index][1]
         for ax in (line_ax, hist_ax):
@@ -328,8 +479,39 @@ def write_gold_profile_png(gold: pl.DataFrame, metadata: dict[str, Any], path: P
             ax.tick_params(colors="#d8dee9", labelsize=7)
             for spine in ax.spines.values():
                 spine.set_color("#3b4252")
+        for missing_ts in missing_ts_values:
+            line_ax.axvspan(
+                missing_ts - timedelta(seconds=30),
+                missing_ts + timedelta(seconds=30),
+                color="#bf616a",
+                alpha=0.16,
+                linewidth=0,
+            )
         line_ax.plot(ts_values, values, color="#88c0d0", linewidth=0.9)
         line_ax.set_ylabel(feature, color="#eceff4", fontsize=7)
+        feature_metadata_label = gold_plot_feature_metadata_label(
+            metadata=metadata,
+            plot_gold=plot_gold,
+            feature=feature,
+            feature_stats=feature_stats[feature],
+        )
+        line_ax.text(
+            0.005,
+            0.985,
+            feature_metadata_label,
+            transform=line_ax.transAxes,
+            ha="left",
+            va="top",
+            fontsize=6,
+            color="#d8dee9",
+            family="monospace",
+            bbox={
+                "boxstyle": "round,pad=0.25",
+                "facecolor": "#111217",
+                "edgecolor": "#3b4252",
+                "alpha": 0.82,
+            },
+        )
         if index == 0:
             line_ax.set_title("Gold M1 numeric feature lines", color="#eceff4", fontsize=11)
             line_ax.legend([legend], loc="upper left", fontsize=7, facecolor="#161922", labelcolor="#eceff4")
@@ -339,9 +521,117 @@ def write_gold_profile_png(gold: pl.DataFrame, metadata: dict[str, Any], path: P
             hist_ax.set_title("Distribution", color="#eceff4", fontsize=11)
 
     fig.autofmt_xdate(rotation=20)
-    fig.tight_layout()
+    fig.tight_layout(rect=(0, 0, 1, 0.94))
     fig.savefig(path, dpi=120, facecolor=fig.get_facecolor())
     plt.close(fig)
+
+
+def gold_plot_metadata_lines(metadata: dict[str, Any], gold: pl.DataFrame) -> list[str]:
+    """Return compact manifest metadata lines for Gold profile plots."""
+
+    source_summary = metadata.get("source_silver_dataset_summaries", {})
+    source_symbols = source_summary.get("source_symbols", []) if isinstance(source_summary, dict) else []
+    source_symbol_text = ", ".join(
+        f"{item.get('source_symbol')}:{item.get('row_count')}"
+        for item in source_symbols
+        if isinstance(item, dict)
+    )
+    symbol = str(gold["symbol"][0]) if gold.height and "symbol" in gold.columns else "unknown"
+    exchange = str(gold["exchange"][0]) if gold.height and "exchange" in gold.columns else "unknown"
+    instrument_type = (
+        str(gold["instrument_type"][0]) if gold.height and "instrument_type" in gold.columns else "unknown"
+    )
+    depth = str(gold["depth"][0]) if gold.height and "depth" in gold.columns else "unknown"
+    title = f"Gold {metadata.get('timeframe', GOLD_TIMEFRAME)} profile"
+    source_row_count = source_summary.get("row_count") if isinstance(source_summary, dict) else None
+    return [
+        f"{title} | {exchange} {symbol} {instrument_type} depth={depth}",
+        (
+            f"dataset={metadata.get('dataset_type')} version={metadata.get('feature_set_version')} "
+            f"hash={metadata.get('hash_string')} git={str(metadata.get('git_commit_hash', 'unknown'))[:12]}"
+        ),
+        (
+            f"window={metadata.get('timestamp_min')} -> {metadata.get('timestamp_max')} "
+            f"rows={metadata.get('row_count')} columns={metadata.get('column_count')} "
+            f"missing_minutes={metadata.get('missing_minute_count', 0)}"
+        ),
+        (
+            f"quality expected_snapshots_per_minute={metadata.get('expected_snapshots_per_minute')} "
+            f"completeness_threshold={metadata.get('completeness_threshold')}"
+        ),
+        f"source_silver_rows={source_row_count} symbols={source_symbol_text or 'none'}",
+        f"built_utc={metadata.get('build_timestamp_utc')}",
+    ]
+
+
+def gold_plot_sample(gold: pl.DataFrame, max_points: int = GOLD_PLOT_MAX_POINTS) -> pl.DataFrame:
+    """Return at most ``max_points`` rows evenly representing the full Gold time scale."""
+
+    if max_points <= 0:
+        raise ValueError("max_points must be positive")
+    if gold.height <= max_points:
+        return gold
+    if max_points == 1:
+        return gold.head(1)
+
+    sampled_indices = sorted(
+        {
+            round(index * (gold.height - 1) / (max_points - 1))
+            for index in range(max_points)
+        }
+    )
+    return gold.with_row_index("_plot_index").filter(pl.col("_plot_index").is_in(sampled_indices)).drop("_plot_index")
+
+
+def gold_plot_feature_metadata_label(
+    metadata: dict[str, Any],
+    feature: str,
+    feature_stats: dict[str, int],
+    plot_gold: pl.DataFrame | None = None,
+) -> str:
+    """Return compact per-feature plot metadata."""
+
+    plot_row_count = plot_gold.height if plot_gold is not None else feature_stats["row_count"]
+    return "\n".join(
+        [
+            f"feature={feature}",
+            f"time={metadata.get('timestamp_min')} -> {metadata.get('timestamp_max')}",
+            (
+                f"rows={feature_stats['row_count']} plot_rows={plot_row_count} "
+                f"missing={metadata.get('missing_minute_count', 0)}"
+            ),
+            (
+                f"valid={feature_stats['finite_count']} null={feature_stats['null_count']} "
+                f"nan={feature_stats['nan_count']} nonfinite={feature_stats['nonfinite_count']}"
+            ),
+        ]
+    )
+
+
+def gold_plot_feature_row_stats_map(gold: pl.DataFrame, features: list[str]) -> dict[str, dict[str, int]]:
+    """Return row-level statistics for plotted Gold features."""
+
+    return {feature: gold_plot_feature_row_stats(gold=gold, feature=feature) for feature in features}
+
+
+def gold_plot_feature_row_stats(gold: pl.DataFrame, feature: str) -> dict[str, int]:
+    """Return row-level statistics for one plotted Gold feature."""
+
+    if feature not in gold.columns:
+        return {"row_count": gold.height, "null_count": 0, "nan_count": 0, "finite_count": 0, "nonfinite_count": 0}
+
+    series = gold[feature]
+    null_count = int(series.null_count())
+    nan_count = int(series.is_nan().sum()) if series.dtype.is_numeric() else 0
+    finite_count = int(series.is_finite().fill_null(False).sum()) if series.dtype.is_numeric() else 0
+    nonfinite_count = max(0, gold.height - null_count - finite_count)
+    return {
+        "row_count": gold.height,
+        "null_count": null_count,
+        "nan_count": nan_count,
+        "finite_count": finite_count,
+        "nonfinite_count": nonfinite_count,
+    }
 
 
 def base_asset_symbol(symbol: str) -> str:
@@ -392,6 +682,40 @@ def source_summary_for_symbol(source_summary: dict[str, Any], symbol: str) -> di
     }
 
 
+def _minute_range(start: datetime, end: datetime) -> list[datetime]:
+    """Return inclusive one-minute timestamps from start through end."""
+
+    values: list[datetime] = []
+    current = start
+    while current <= end:
+        values.append(current)
+        current += timedelta(minutes=1)
+    return values
+
+
+def _missing_minute_timestamps(gold: pl.DataFrame) -> list[datetime]:
+    """Return Gold timestamps explicitly marked as missing timeframe rows."""
+
+    if "quality_flags" not in gold.columns or "ts_minute" not in gold.columns:
+        return []
+    rows = gold.select("ts_minute", "quality_flags").to_dicts()
+    return [
+        row["ts_minute"]
+        for row in rows
+        if isinstance(row["ts_minute"], datetime)
+        and isinstance(row["quality_flags"], list)
+        and "missing_minute" in row["quality_flags"]
+    ]
+
+
+def _missing_minute_count(gold: pl.DataFrame) -> int:
+    """Return the number of explicit missing timeframe rows in a Gold dataset."""
+
+    if "quality_flags" not in gold.columns:
+        return 0
+    return int(gold.select(pl.col("quality_flags").list.contains("missing_minute").sum()).item())
+
+
 def _book_pressure_exprs() -> list[pl.Expr]:
     """Return book-pressure expressions for standard depth windows."""
 
@@ -437,6 +761,7 @@ def _column_metadata(gold: pl.DataFrame, column: str) -> dict[str, Any]:
         "null_ratio": float(series.null_count() / max(1, gold.height)),
     }
     if series.dtype.is_numeric():
+        metadata["nan_count"] = int(series.is_nan().sum())
         metadata["numeric_stats"] = {
             "mean": _scalar(series.mean()),
             "std": _scalar(series.std()),

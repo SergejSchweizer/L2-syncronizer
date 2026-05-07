@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -10,17 +11,27 @@ import polars as pl
 
 from ingestion.gold import (
     base_asset_symbol,
+    gold_l2_m1_dataset_path,
     gold_l2_m1_from_silver,
+    gold_metadata,
+    gold_plot_feature_metadata_label,
+    gold_plot_metadata_lines,
+    gold_plot_sample,
     silver_parquet_files,
     silver_source_summary,
     write_gold_l2_m1_artifacts,
 )
 
 
-def _silver_row(second: int, mid_price: float, symbol: str = "BTC-PERPETUAL") -> dict[str, object]:
+def _silver_row(
+    second: int,
+    mid_price: float,
+    symbol: str = "BTC-PERPETUAL",
+    minute: int = 0,
+) -> dict[str, object]:
     """Build one representative silver L2 feature row."""
 
-    ts_event = datetime(2026, 5, 6, 10, 0, second, tzinfo=UTC)
+    ts_event = datetime(2026, 5, 6, 10, minute, second, tzinfo=UTC)
     row: dict[str, object] = {
         "schema_version": "v1",
         "dataset_type": "l2_snapshot_features",
@@ -91,8 +102,36 @@ def test_gold_l2_m1_from_silver_computes_ohlc_and_quality() -> None:
     assert row["open_interest_last"] == 1040.0
 
 
+def test_gold_l2_m1_from_silver_inserts_missing_minutes_as_nan_rows() -> None:
+    """Verify Gold spans the full M1 scale and marks missing minutes explicitly."""
+
+    silver = pl.DataFrame(
+        [
+            _silver_row(second=0, minute=0, mid_price=100.0),
+            _silver_row(second=0, minute=2, mid_price=102.0),
+        ]
+    )
+
+    gold = gold_l2_m1_from_silver(silver)
+    missing = gold.row(1, named=True)
+
+    assert gold["ts_minute"].to_list() == [
+        datetime(2026, 5, 6, 10, 0, tzinfo=UTC),
+        datetime(2026, 5, 6, 10, 1, tzinfo=UTC),
+        datetime(2026, 5, 6, 10, 2, tzinfo=UTC),
+    ]
+    assert missing["snapshot_count"] == 0
+    assert missing["coverage_ratio"] == 0.0
+    assert missing["first_snapshot_ts"] is None
+    assert missing["last_snapshot_ts"] is None
+    assert missing["is_complete_minute"] is False
+    assert missing["quality_flags"] == ["missing_minute"]
+    assert math.isnan(missing["mid_open"])
+    assert math.isnan(missing["mid_close"])
+
+
 def test_write_gold_l2_m1_artifacts_writes_parquet_json_and_png(tmp_path: Path) -> None:
-    """Verify per-symbol gold artifacts share a basename and omit source paths from JSON."""
+    """Verify Gold artifacts are written under the versioned timeframe dataset leaf."""
 
     silver = _sample_silver_frame()
     gold = gold_l2_m1_from_silver(silver)
@@ -111,9 +150,24 @@ def test_write_gold_l2_m1_artifacts_writes_parquet_json_and_png(tmp_path: Path) 
     basename = basenames.pop()
     assert basename.startswith("BTC_L2_")
     assert basename.endswith("_abcdef123456")
+    expected_dir = (
+        tmp_path
+        / "dataset_type=l2_m1_features"
+        / "feature_set_version=gold_l2_m1_v1"
+        / "exchange=deribit"
+        / "instrument_type=perp"
+        / "base_asset=BTC"
+        / "symbol=BTC-PERPETUAL"
+        / "depth=50"
+        / "timeframe=1m"
+    )
+    assert {Path(file_path).parent for file_path in files} == {expected_dir}
 
     metadata_path = next(Path(file_path) for file_path in files if file_path.endswith(".json"))
     metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    assert metadata["dataset_type"] == "l2_m1_features"
+    assert metadata["feature_set_version"] == "gold_l2_m1_v1"
+    assert metadata["timeframe"] == "1m"
     assert metadata["row_count"] == 1
     assert metadata["column_count"] == len(gold.columns)
     assert metadata["source_silver_dataset_summaries"]["source_symbols"] == [
@@ -146,6 +200,135 @@ def test_write_gold_l2_m1_artifacts_skips_manifest_and_plot_when_disabled(tmp_pa
     assert Path(files[0]).exists()
     assert not any(path.name.endswith(".json") for path in Path(tmp_path).rglob("*.json"))
     assert not any(path.name.endswith(".png") for path in Path(tmp_path).rglob("*.png"))
+
+
+def test_gold_plot_metadata_lines_include_manifest_context() -> None:
+    """Verify Gold plot headers carry important manifest metadata."""
+
+    silver = _sample_silver_frame()
+    gold = gold_l2_m1_from_silver(silver)
+    metadata = gold_metadata(
+        gold=gold,
+        source_summary=silver_source_summary(silver),
+        hash_string="hash123",
+        git_commit_hash="abcdef1234567890",
+        expected_snapshots_per_minute=6,
+        completeness_threshold=0.8,
+        feature_set_version="gold_l2_m1_v1",
+    )
+
+    lines = gold_plot_metadata_lines(metadata=metadata, gold=gold)
+    rendered = "\n".join(lines)
+
+    assert "Gold 1m profile" in lines[0]
+    assert "dataset=l2_m1_features" in rendered
+    assert "version=gold_l2_m1_v1" in rendered
+    assert "hash=hash123" in rendered
+    assert "git=abcdef123456" in rendered
+    assert "rows=1" in rendered
+    assert "missing_minutes=0" in rendered
+    assert "expected_snapshots_per_minute=6" in rendered
+    assert "completeness_threshold=0.8" in rendered
+    assert "source_silver_rows=5" in rendered
+    assert "BTC-PERPETUAL:5" in rendered
+
+
+def test_gold_plot_feature_metadata_label_is_limited_to_feature_time_and_rows() -> None:
+    """Verify every Gold feature subplot carries only compact feature/time/row metadata."""
+
+    silver = _sample_silver_frame()
+    gold = gold_l2_m1_from_silver(silver)
+    metadata = gold_metadata(
+        gold=gold,
+        source_summary=silver_source_summary(silver),
+        hash_string="hash123",
+        git_commit_hash="abcdef1234567890",
+        expected_snapshots_per_minute=6,
+        completeness_threshold=0.8,
+        feature_set_version="gold_l2_m1_v1",
+    )
+
+    label = gold_plot_feature_metadata_label(
+        metadata=metadata,
+        feature="mid_close",
+        feature_stats={
+            "row_count": gold.height,
+            "null_count": 0,
+            "nan_count": 0,
+            "finite_count": 1,
+            "nonfinite_count": 0,
+        },
+        plot_gold=gold,
+    )
+
+    assert "feature=mid_close" in label
+    assert "time=2026-05-06T10:00:00+00:00 -> 2026-05-06T10:00:00+00:00" in label
+    assert "rows=1 plot_rows=1 missing=0" in label
+    assert "valid=1 null=0 nan=0 nonfinite=0" in label
+    assert "l2_m1_features" not in label
+    assert "gold_l2_m1_v1" not in label
+    assert "BTC-PERPETUAL" not in label
+    assert "hash123" not in label
+    assert "abcdef123456" not in label
+    assert "threshold=0.8" not in label
+
+
+def test_gold_plot_sample_caps_points_across_full_time_scale() -> None:
+    """Verify Gold plots use bounded samples that preserve full time-scale endpoints."""
+
+    gold = pl.DataFrame(
+        {
+            "ts_minute": [datetime(2026, 5, 6, 10, minute, tzinfo=UTC) for minute in range(10)],
+            "mid_close": [float(value) for value in range(10)],
+        }
+    )
+
+    sampled = gold_plot_sample(gold=gold, max_points=4)
+
+    assert sampled.height == 4
+    assert sampled["ts_minute"][0] == gold["ts_minute"][0]
+    assert sampled["ts_minute"][-1] == gold["ts_minute"][-1]
+    assert sampled["ts_minute"].to_list() == [
+        datetime(2026, 5, 6, 10, 0, tzinfo=UTC),
+        datetime(2026, 5, 6, 10, 3, tzinfo=UTC),
+        datetime(2026, 5, 6, 10, 6, tzinfo=UTC),
+        datetime(2026, 5, 6, 10, 9, tzinfo=UTC),
+    ]
+
+
+def test_gold_plot_sample_supports_single_point_cap() -> None:
+    """Verify plot sampling handles a one-point cap without division errors."""
+
+    gold = pl.DataFrame(
+        {
+            "ts_minute": [datetime(2026, 5, 6, 10, minute, tzinfo=UTC) for minute in range(3)],
+            "mid_close": [float(value) for value in range(3)],
+        }
+    )
+
+    sampled = gold_plot_sample(gold=gold, max_points=1)
+
+    assert sampled.height == 1
+    assert sampled["ts_minute"][0] == datetime(2026, 5, 6, 10, 0, tzinfo=UTC)
+
+
+def test_gold_l2_m1_dataset_path_uses_timeframe_leaf() -> None:
+    """Verify Gold dataset paths stop at the full versioned timeframe level."""
+
+    result = gold_l2_m1_dataset_path(
+        lake_root="lake/gold",
+        feature_set_version="gold_l2_m1_v1",
+        exchange="deribit",
+        instrument_type="perp",
+        base_asset="BTC",
+        symbol="BTC-PERPETUAL",
+        depth=50,
+    )
+
+    assert str(result).endswith(
+        "lake/gold/dataset_type=l2_m1_features/feature_set_version=gold_l2_m1_v1/"
+        "exchange=deribit/instrument_type=perp/base_asset=BTC/symbol=BTC-PERPETUAL/depth=50/timeframe=1m"
+    )
 
 
 def test_base_asset_symbol_handles_deribit_symbols() -> None:
