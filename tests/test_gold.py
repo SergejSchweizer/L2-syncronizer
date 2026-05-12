@@ -150,6 +150,28 @@ def test_gold_l2_m1_from_silver_inserts_missing_minutes_as_nan_rows() -> None:
     assert math.isnan(missing["mid_close"])
 
 
+def test_gold_l2_m1_from_silver_can_fill_missing_minutes_from_neighbor_averages() -> None:
+    """Verify optional Gold fill averages numeric features from adjacent observed minutes."""
+
+    silver = pl.DataFrame(
+        [
+            _silver_row(second=0, minute=0, mid_price=100.0),
+            _silver_row(second=0, minute=2, mid_price=102.0),
+        ]
+    )
+
+    gold = gold_l2_m1_from_silver(silver, fill_missing_minutes=True)
+    filled = gold.row(1, named=True)
+
+    assert filled["snapshot_count"] == 0
+    assert filled["coverage_ratio"] == 0.0
+    assert filled["is_complete_minute"] is False
+    assert filled["quality_flags"] == ["missing_minute", "filled_neighbor_average"]
+    assert filled["mid_open"] == 101.0
+    assert filled["mid_close"] == 101.0
+    assert filled["mark_price_last"] == 101.01
+
+
 def test_write_gold_l2_m1_artifacts_writes_parquet_json_and_png(tmp_path: Path) -> None:
     """Verify Gold artifacts are written under the versioned timeframe dataset leaf."""
 
@@ -222,7 +244,6 @@ def test_write_gold_l2_m1_artifacts_skips_manifest_and_plot_when_disabled(tmp_pa
     assert Path(files[0]).exists()
     assert not any(path.name.endswith(".json") for path in Path(tmp_path).rglob("*.json"))
     assert not any(path.name.endswith(".png") for path in Path(tmp_path).rglob("*.png"))
-    assert (Path(files[0]).parent / ".write.lock").exists()
 
 
 def test_write_gold_l2_m1_artifacts_hash_changes_when_output_data_changes(tmp_path: Path) -> None:

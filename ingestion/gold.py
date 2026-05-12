@@ -14,7 +14,6 @@ from typing import Any
 import polars as pl
 
 from ingestion.artifact_state import file_fingerprints, load_json_state, write_json_state
-from ingestion.file_lock import FileLock
 
 GOLD_FEATURE_SET_VERSION = "gold_l2_m1_v1"
 GOLD_L2_M1_DATASET_TYPE = "l2_m1_features"
@@ -101,6 +100,7 @@ def transform_l2_silver_to_gold(
     feature_set_version: str = GOLD_FEATURE_SET_VERSION,
     plot: bool = True,
     manifest: bool = True,
+    fill_missing_minutes: bool = False,
 ) -> list[str]:
     """Transform silver L2 snapshot features into per-symbol gold M1 artifacts."""
 
@@ -124,6 +124,7 @@ def transform_l2_silver_to_gold(
         and state.get("completeness_threshold") == completeness_threshold
         and state.get("feature_set_version") == feature_set_version
         and state.get("git_commit_hash") == git_commit_hash
+        and state.get("fill_missing_minutes") == fill_missing_minutes
     )
     changed_symbols = [
         symbol
@@ -147,6 +148,7 @@ def transform_l2_silver_to_gold(
             expected_snapshots_per_minute=expected_snapshots_per_minute,
             completeness_threshold=completeness_threshold,
             feature_set_version=feature_set_version,
+            fill_missing_minutes=fill_missing_minutes,
         )
         symbol_written_files = write_gold_l2_m1_artifacts(
             gold=gold,
@@ -160,6 +162,7 @@ def transform_l2_silver_to_gold(
             manifest=manifest,
             densify=False,
             source_fingerprints=symbol_fingerprints,
+            fill_missing_minutes=fill_missing_minutes,
         )
         written_files.extend(symbol_written_files)
         next_symbol_state[symbol] = {
@@ -177,6 +180,7 @@ def transform_l2_silver_to_gold(
             "completeness_threshold": completeness_threshold,
             "feature_set_version": feature_set_version,
             "git_commit_hash": git_commit_hash,
+            "fill_missing_minutes": fill_missing_minutes,
             "changed_symbols": changed_symbols,
             "symbols": next_symbol_state,
         },
@@ -222,6 +226,7 @@ def gold_l2_m1_from_silver(
     expected_snapshots_per_minute: int = EXPECTED_SNAPSHOTS_PER_MINUTE,
     completeness_threshold: float = COMPLETE_MINUTE_COVERAGE_THRESHOLD,
     feature_set_version: str = GOLD_FEATURE_SET_VERSION,
+    fill_missing_minutes: bool = False,
 ) -> pl.DataFrame:
     """Aggregate silver L2 snapshot features to one M1 gold row per symbol."""
 
@@ -278,7 +283,10 @@ def gold_l2_m1_from_silver(
         .select(GOLD_COLUMNS)
         .sort(["symbol", "ts_minute"])
     )
-    return densify_gold_m1_timeframe(observed)
+    dense = densify_gold_m1_timeframe(observed)
+    if fill_missing_minutes:
+        return fill_gold_missing_minutes_with_neighbor_averages(dense)
+    return dense
 
 
 def densify_gold_m1_timeframe(gold: pl.DataFrame) -> pl.DataFrame:
@@ -328,6 +336,32 @@ def densify_gold_m1_timeframe(gold: pl.DataFrame) -> pl.DataFrame:
     return pl.concat(dense_frames, how="vertical").sort(["symbol", "ts_minute"])
 
 
+def fill_gold_missing_minutes_with_neighbor_averages(gold: pl.DataFrame) -> pl.DataFrame:
+    """Fill missing Gold numeric features from adjacent observed minute averages."""
+
+    if gold.is_empty():
+        return gold
+
+    filled_frames: list[pl.DataFrame] = []
+    for partition in gold.partition_by(GOLD_DATASET_PARTITION_COLUMNS):
+        rows = partition.sort("ts_minute").to_dicts()
+        for index, row in enumerate(rows):
+            if "missing_minute" not in _quality_flags(row):
+                continue
+            if index == 0 or index >= len(rows) - 1:
+                continue
+            previous_row = rows[index - 1]
+            following_row = rows[index + 1]
+            if "missing_minute" in _quality_flags(previous_row) or "missing_minute" in _quality_flags(following_row):
+                continue
+            for feature in GOLD_NUMERIC_FEATURES:
+                row[feature] = _average_gold_feature(previous_row.get(feature), following_row.get(feature))
+            row["quality_flags"] = _merged_quality_flags(row, "filled_neighbor_average")
+        filled_frames.append(pl.DataFrame(rows, schema=partition.schema))
+
+    return pl.concat(filled_frames, how="vertical").select(GOLD_COLUMNS).sort(["symbol", "ts_minute"])
+
+
 def write_gold_l2_m1_artifacts(
     gold: pl.DataFrame,
     gold_lake_root: str,
@@ -340,6 +374,7 @@ def write_gold_l2_m1_artifacts(
     manifest: bool = True,
     densify: bool = True,
     source_fingerprints: dict[str, Any] | None = None,
+    fill_missing_minutes: bool = False,
 ) -> list[str]:
     """Write full versioned Gold datasets under lake-style timeframe leaves."""
 
@@ -348,6 +383,8 @@ def write_gold_l2_m1_artifacts(
 
     if densify:
         gold = densify_gold_m1_timeframe(gold)
+        if fill_missing_minutes:
+            gold = fill_gold_missing_minutes_with_neighbor_averages(gold)
     written_files: list[str] = []
 
     for symbol_frame in gold.partition_by(GOLD_DATASET_PARTITION_COLUMNS):
@@ -368,6 +405,7 @@ def write_gold_l2_m1_artifacts(
             "source_summary": source_symbol_summary,
             "source_fingerprints": source_fingerprints or {},
             "gold_content_hash": gold_content_hash,
+            "fill_missing_minutes": fill_missing_minutes,
             "gold_schema": {name: str(dtype) for name, dtype in symbol_frame.schema.items()},
         }
         hash_string = stable_json_hash(hash_payload)
@@ -386,34 +424,33 @@ def write_gold_l2_m1_artifacts(
         parquet_path = dataset_dir / f"{basename}.parquet"
         json_path = dataset_dir / f"{basename}.json"
         png_path = dataset_dir / f"{basename}.png"
-        lock_path = dataset_dir / ".write.lock"
 
-        with FileLock(lock_path):
-            symbol_frame.write_parquet(parquet_path)
-            written_files.append(str(parquet_path.resolve()))
+        symbol_frame.write_parquet(parquet_path)
+        written_files.append(str(parquet_path.resolve()))
 
-            metadata: dict[str, Any] | None = None
-            if manifest or plot:
-                metadata = gold_metadata(
-                    gold=symbol_frame,
-                    source_summary=source_symbol_summary,
-                    hash_string=hash_string,
-                    git_commit_hash=git_commit_hash,
-                    expected_snapshots_per_minute=expected_snapshots_per_minute,
-                    completeness_threshold=completeness_threshold,
-                    feature_set_version=identity.feature_set_version,
-                    source_fingerprints=source_fingerprints or {},
-                    gold_content_hash=gold_content_hash,
-                )
+        metadata: dict[str, Any] | None = None
+        if manifest or plot:
+            metadata = gold_metadata(
+                gold=symbol_frame,
+                source_summary=source_symbol_summary,
+                hash_string=hash_string,
+                git_commit_hash=git_commit_hash,
+                expected_snapshots_per_minute=expected_snapshots_per_minute,
+                completeness_threshold=completeness_threshold,
+                feature_set_version=identity.feature_set_version,
+                source_fingerprints=source_fingerprints or {},
+                gold_content_hash=gold_content_hash,
+                fill_missing_minutes=fill_missing_minutes,
+            )
 
-            if manifest:
-                json_path.write_text(json.dumps(metadata, indent=2, sort_keys=True), encoding="utf-8")
-                written_files.append(str(json_path.resolve()))
+        if manifest:
+            json_path.write_text(json.dumps(metadata, indent=2, sort_keys=True), encoding="utf-8")
+            written_files.append(str(json_path.resolve()))
 
-            if plot:
-                assert metadata is not None
-                write_gold_profile_png(gold=symbol_frame, metadata=metadata, path=png_path)
-                written_files.append(str(png_path.resolve()))
+        if plot:
+            assert metadata is not None
+            write_gold_profile_png(gold=symbol_frame, metadata=metadata, path=png_path)
+            written_files.append(str(png_path.resolve()))
 
     return sorted(written_files)
 
@@ -489,6 +526,7 @@ def gold_metadata(
     feature_set_version: str,
     source_fingerprints: dict[str, Any] | None = None,
     gold_content_hash: str | None = None,
+    fill_missing_minutes: bool = False,
 ) -> dict[str, Any]:
     """Build JSON metadata for one gold artifact without filesystem paths."""
 
@@ -503,6 +541,7 @@ def gold_metadata(
         "timeframe": GOLD_TIMEFRAME,
         "expected_snapshots_per_minute": expected_snapshots_per_minute,
         "completeness_threshold": completeness_threshold,
+        "fill_missing_minutes": fill_missing_minutes,
         "row_count": gold.height,
         "column_count": len(gold.columns),
         "timestamp_min": timestamp_min,
@@ -813,6 +852,32 @@ def _missing_minute_count(gold: pl.DataFrame) -> int:
     if "quality_flags" not in gold.columns:
         return 0
     return int(gold.select(pl.col("quality_flags").list.contains("missing_minute").sum()).item())
+
+
+def _quality_flags(row: dict[str, Any]) -> list[str]:
+    """Return quality flags from a Gold row dictionary."""
+
+    flags = row.get("quality_flags", [])
+    return [str(flag) for flag in flags] if isinstance(flags, list) else []
+
+
+def _merged_quality_flags(row: dict[str, Any], flag: str) -> list[str]:
+    """Return row quality flags with one additional unique flag."""
+
+    flags = _quality_flags(row)
+    return flags if flag in flags else [*flags, flag]
+
+
+def _average_gold_feature(previous_value: object, following_value: object) -> float:
+    """Average adjacent Gold numeric feature values, preserving NaN when either side is non-finite."""
+
+    if not isinstance(previous_value, int | float) or not isinstance(following_value, int | float):
+        return float("nan")
+    previous = float(previous_value)
+    following = float(following_value)
+    if not math.isfinite(previous) or not math.isfinite(following):
+        return float("nan")
+    return (previous + following) / 2
 
 
 def _book_pressure_exprs() -> list[pl.Expr]:

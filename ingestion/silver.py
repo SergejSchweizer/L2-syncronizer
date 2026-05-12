@@ -11,7 +11,6 @@ from typing import Any, cast
 import polars as pl
 
 from ingestion.artifact_state import file_fingerprints, load_json_state, write_json_state
-from ingestion.file_lock import FileLock
 
 SILVER_L2_FEATURE_DATASET_TYPE = "l2_snapshot_features"
 SILVER_SCHEMA_VERSION = "v1"
@@ -231,28 +230,25 @@ def save_silver_l2_snapshot_features(
         metadata_path = part_dir / f"{month_partition}.json"
         plot_path = part_dir / f"{month_partition}.png"
         legacy_file_path = part_dir / "data.parquet"
-        lock_path = part_dir / ".write.lock"
+        output = partition
+        existing_file_path = file_path if file_path.exists() else legacy_file_path
+        if existing_file_path.exists():
+            output = pl.concat([pl.read_parquet(existing_file_path), partition], how="vertical")
 
-        with FileLock(lock_path):
-            output = partition
-            existing_file_path = file_path if file_path.exists() else legacy_file_path
-            if existing_file_path.exists():
-                output = pl.concat([pl.read_parquet(existing_file_path), partition], how="vertical")
+        output = output.unique(subset=SILVER_NATURAL_KEY, keep="last").sort("ts_event")
+        output.write_parquet(staging_path)
+        staging_path.replace(file_path)
 
-            output = output.unique(subset=SILVER_NATURAL_KEY, keep="last").sort("ts_event")
-            output.write_parquet(staging_path)
-            staging_path.replace(file_path)
-
-            written_files.append(str(file_path.resolve()))
-            if manifest:
-                metadata_path.write_text(
-                    json.dumps(silver_artifact_metadata(output), indent=2, sort_keys=True),
-                    encoding="utf-8",
-                )
-                written_files.append(str(metadata_path.resolve()))
-            if plot:
-                write_silver_profile_png(silver=output, path=plot_path)
-                written_files.append(str(plot_path.resolve()))
+        written_files.append(str(file_path.resolve()))
+        if manifest:
+            metadata_path.write_text(
+                json.dumps(silver_artifact_metadata(output), indent=2, sort_keys=True),
+                encoding="utf-8",
+            )
+            written_files.append(str(metadata_path.resolve()))
+        if plot:
+            write_silver_profile_png(silver=output, path=plot_path)
+            written_files.append(str(plot_path.resolve()))
 
     return sorted(written_files)
 

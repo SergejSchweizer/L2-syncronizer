@@ -11,16 +11,11 @@ from typing import cast
 
 from api.constants import (
     BRONZE_BUILDER_COMMAND,
-    BRONZE_BUILDER_LOCK_PATH,
     GOLD_BUILDER_COMMAND,
-    GOLD_BUILDER_LOCK_PATH,
     SILVER_BUILDER_COMMAND,
-    SILVER_BUILDER_LOCK_PATH,
     VALIDATE_SYMBOLS_COMMAND,
 )
 from api.runtime import (
-    SingleInstanceError,
-    SingleInstanceLock,
     configure_logging,
     fetch_concurrency,
 )
@@ -40,7 +35,7 @@ from ingestion.l2 import L2Snapshot, fetch_l2_snapshots_for_symbols
 from ingestion.lake import save_l2_snapshot_parquet_lake
 from ingestion.silver import transform_l2_bronze_to_silver
 
-__all__ = ["SingleInstanceError", "SingleInstanceLock", "build_parser", "main"]
+__all__ = ["build_parser", "main"]
 
 SnapshotsBySymbol = dict[str, list[L2Snapshot]]
 
@@ -189,6 +184,12 @@ def build_parser(config: Config | None = None) -> argparse.ArgumentParser:
         type=float,
         default=0.8,
         help="Minimum coverage ratio for a complete minute",
+    )
+    _boolean_optional_flag(
+        gold_parser,
+        "fill-missing-minutes",
+        False,
+        "Fill missing Gold numeric features with adjacent-minute averages",
     )
     _boolean_optional_flag(
         gold_parser,
@@ -404,146 +405,135 @@ def _warn_for_long_poll_schedule(
 def _run_bronze_builder(args: argparse.Namespace, logger: logging.Logger, config: Config) -> None:
     """Run L2 snapshot collection and optional raw bronze persistence."""
 
-    try:
-        with SingleInstanceLock(BRONZE_BUILDER_LOCK_PATH):
-            started_at = perf_counter()
-            exchange = cast(str, args.exchange)
-            symbols = _normalize_cli_symbols(cast(list[str], args.symbols))
-            requested_snapshots = int(args.snapshot_count)
-            max_runtime_s = float(args.max_runtime_s)
-            _warn_for_long_poll_schedule(
-                logger=logger,
-                snapshot_count=requested_snapshots,
-                poll_interval_s=float(args.poll_interval_s),
-                max_runtime_s=max_runtime_s,
-            )
-            snapshots_by_symbol = fetch_l2_snapshots_for_symbols(
-                exchange=exchange,
-                symbols=symbols,
-                depth=int(args.levels),
-                snapshot_count=requested_snapshots,
-                poll_interval_s=float(args.poll_interval_s),
-                max_runtime_s=max_runtime_s if max_runtime_s > 0 else None,
-                concurrency=fetch_concurrency(config),
-            )
+    started_at = perf_counter()
+    exchange = cast(str, args.exchange)
+    symbols = _normalize_cli_symbols(cast(list[str], args.symbols))
+    requested_snapshots = int(args.snapshot_count)
+    max_runtime_s = float(args.max_runtime_s)
+    _warn_for_long_poll_schedule(
+        logger=logger,
+        snapshot_count=requested_snapshots,
+        poll_interval_s=float(args.poll_interval_s),
+        max_runtime_s=max_runtime_s,
+    )
+    snapshots_by_symbol = fetch_l2_snapshots_for_symbols(
+        exchange=exchange,
+        symbols=symbols,
+        depth=int(args.levels),
+        snapshot_count=requested_snapshots,
+        poll_interval_s=float(args.poll_interval_s),
+        max_runtime_s=max_runtime_s if max_runtime_s > 0 else None,
+        concurrency=fetch_concurrency(config),
+    )
 
-            output = _build_snapshot_output(
-                exchange=exchange,
-                symbols=symbols,
-                snapshots_by_symbol=snapshots_by_symbol,
-                requested_snapshots=requested_snapshots,
-                logger=logger,
-            )
-            parquet_files, parquet_error = _persist_bronze_snapshots(
-                snapshots_by_symbol=snapshots_by_symbol,
-                lake_root=cast(str, args.lake_root),
-                depth=int(args.levels),
-                enabled=bool(args.save_parquet_lake),
-                output=output,
-                logger=logger,
-            )
+    output = _build_snapshot_output(
+        exchange=exchange,
+        symbols=symbols,
+        snapshots_by_symbol=snapshots_by_symbol,
+        requested_snapshots=requested_snapshots,
+        logger=logger,
+    )
+    parquet_files, parquet_error = _persist_bronze_snapshots(
+        snapshots_by_symbol=snapshots_by_symbol,
+        lake_root=cast(str, args.lake_root),
+        depth=int(args.levels),
+        enabled=bool(args.save_parquet_lake),
+        output=output,
+        logger=logger,
+    )
 
-            if bool(args.json_output):
-                print(json.dumps(output, indent=2))
-            _log_bronze_builder_summary(
-                logger=logger,
-                exchange=exchange,
-                symbols=symbols,
-                snapshots_by_symbol=snapshots_by_symbol,
-                requested_snapshots=requested_snapshots,
-                parquet_files=parquet_files,
-                elapsed_s=perf_counter() - started_at,
-                parquet_error=parquet_error,
-            )
-    except SingleInstanceError as exc:
-        logger.warning("Single-instance lock active for bronze-builder")
-        raise SystemExit(str(exc)) from exc
+    if bool(args.json_output):
+        print(json.dumps(output, indent=2))
+    _log_bronze_builder_summary(
+        logger=logger,
+        exchange=exchange,
+        symbols=symbols,
+        snapshots_by_symbol=snapshots_by_symbol,
+        requested_snapshots=requested_snapshots,
+        parquet_files=parquet_files,
+        elapsed_s=perf_counter() - started_at,
+        parquet_error=parquet_error,
+    )
 
 
 def _run_silver_builder(args: argparse.Namespace, logger: logging.Logger) -> None:
     """Run Bronze-to-Silver L2 feature transformation."""
 
-    try:
-        with SingleInstanceLock(SILVER_BUILDER_LOCK_PATH):
-            started_at = perf_counter()
-            bronze_lake_root = cast(str, args.bronze_lake_root)
-            silver_lake_root = cast(str, args.silver_lake_root)
-            depth = int(args.depth)
-            written_files = transform_l2_bronze_to_silver(
-                bronze_lake_root=bronze_lake_root,
-                silver_lake_root=silver_lake_root,
-                depth=depth,
-                plot=bool(args.plot),
-                manifest=bool(args.manifest),
-            )
-            elapsed_s = perf_counter() - started_at
-            output = {
-                "command": SILVER_BUILDER_COMMAND,
-                "status": "complete",
-                "bronze_lake_root": bronze_lake_root,
-                "silver_lake_root": silver_lake_root,
-                "depth": depth,
-                "artifact_files": written_files,
-            }
-            if bool(args.json_output):
-                print(json.dumps(output, indent=2))
-            logger.info(
-                "silver-builder run summary status=complete elapsed_s=%.3f bronze_lake_root=%s "
-                "silver_lake_root=%s depth=%s artifact_files=%s",
-                elapsed_s,
-                bronze_lake_root,
-                silver_lake_root,
-                depth,
-                len(written_files),
-            )
-    except SingleInstanceError as exc:
-        logger.warning("Single-instance lock active for silver-builder")
-        raise SystemExit(str(exc)) from exc
+    started_at = perf_counter()
+    bronze_lake_root = cast(str, args.bronze_lake_root)
+    silver_lake_root = cast(str, args.silver_lake_root)
+    depth = int(args.depth)
+    written_files = transform_l2_bronze_to_silver(
+        bronze_lake_root=bronze_lake_root,
+        silver_lake_root=silver_lake_root,
+        depth=depth,
+        plot=bool(args.plot),
+        manifest=bool(args.manifest),
+    )
+    elapsed_s = perf_counter() - started_at
+    output = {
+        "command": SILVER_BUILDER_COMMAND,
+        "status": "complete",
+        "bronze_lake_root": bronze_lake_root,
+        "silver_lake_root": silver_lake_root,
+        "depth": depth,
+        "artifact_files": written_files,
+    }
+    if bool(args.json_output):
+        print(json.dumps(output, indent=2))
+    logger.info(
+        "silver-builder run summary status=complete elapsed_s=%.3f bronze_lake_root=%s "
+        "silver_lake_root=%s depth=%s artifact_files=%s",
+        elapsed_s,
+        bronze_lake_root,
+        silver_lake_root,
+        depth,
+        len(written_files),
+    )
 
 
 def _run_gold_builder(args: argparse.Namespace, logger: logging.Logger) -> None:
     """Run Silver-to-Gold M1 L2 feature transformation."""
 
-    try:
-        with SingleInstanceLock(GOLD_BUILDER_LOCK_PATH):
-            started_at = perf_counter()
-            silver_lake_root = cast(str, args.silver_lake_root)
-            gold_lake_root = cast(str, args.gold_lake_root)
-            expected_snapshots_per_minute = int(args.expected_snapshots_per_minute)
-            completeness_threshold = float(args.completeness_threshold)
-            written_files = transform_l2_silver_to_gold(
-                silver_lake_root=silver_lake_root,
-                gold_lake_root=gold_lake_root,
-                expected_snapshots_per_minute=expected_snapshots_per_minute,
-                completeness_threshold=completeness_threshold,
-                plot=bool(args.plot),
-                manifest=bool(args.manifest),
-            )
-            elapsed_s = perf_counter() - started_at
-            output = {
-                "command": GOLD_BUILDER_COMMAND,
-                "status": "complete",
-                "silver_lake_root": silver_lake_root,
-                "gold_lake_root": gold_lake_root,
-                "expected_snapshots_per_minute": expected_snapshots_per_minute,
-                "completeness_threshold": completeness_threshold,
-                "artifact_files": written_files,
-            }
-            if bool(args.json_output):
-                print(json.dumps(output, indent=2))
-            logger.info(
-                "gold-builder run summary status=complete elapsed_s=%.3f silver_lake_root=%s "
-                "gold_lake_root=%s expected_snapshots_per_minute=%s completeness_threshold=%.3f artifact_files=%s",
-                elapsed_s,
-                silver_lake_root,
-                gold_lake_root,
-                expected_snapshots_per_minute,
-                completeness_threshold,
-                len(written_files),
-            )
-    except SingleInstanceError as exc:
-        logger.warning("Single-instance lock active for gold-builder")
-        raise SystemExit(str(exc)) from exc
+    started_at = perf_counter()
+    silver_lake_root = cast(str, args.silver_lake_root)
+    gold_lake_root = cast(str, args.gold_lake_root)
+    expected_snapshots_per_minute = int(args.expected_snapshots_per_minute)
+    completeness_threshold = float(args.completeness_threshold)
+    written_files = transform_l2_silver_to_gold(
+        silver_lake_root=silver_lake_root,
+        gold_lake_root=gold_lake_root,
+        expected_snapshots_per_minute=expected_snapshots_per_minute,
+        completeness_threshold=completeness_threshold,
+        plot=bool(args.plot),
+        manifest=bool(args.manifest),
+        fill_missing_minutes=bool(args.fill_missing_minutes),
+    )
+    elapsed_s = perf_counter() - started_at
+    output = {
+        "command": GOLD_BUILDER_COMMAND,
+        "status": "complete",
+        "silver_lake_root": silver_lake_root,
+        "gold_lake_root": gold_lake_root,
+        "expected_snapshots_per_minute": expected_snapshots_per_minute,
+        "completeness_threshold": completeness_threshold,
+        "fill_missing_minutes": bool(args.fill_missing_minutes),
+        "artifact_files": written_files,
+    }
+    if bool(args.json_output):
+        print(json.dumps(output, indent=2))
+    logger.info(
+        "gold-builder run summary status=complete elapsed_s=%.3f silver_lake_root=%s "
+        "gold_lake_root=%s expected_snapshots_per_minute=%s completeness_threshold=%.3f "
+        "fill_missing_minutes=%s artifact_files=%s",
+        elapsed_s,
+        silver_lake_root,
+        gold_lake_root,
+        expected_snapshots_per_minute,
+        completeness_threshold,
+        bool(args.fill_missing_minutes),
+        len(written_files),
+    )
 
 
 def _validate_symbol(symbol: str, depth: int) -> dict[str, object]:

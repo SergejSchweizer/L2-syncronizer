@@ -159,7 +159,6 @@ def test_transform_l2_bronze_to_silver_writes_monthly_idempotent_partitions(tmp_
     assert metadata["symbols"] == ["BTC-PERPETUAL"]
     assert Path(png_file).stat().st_size > 0
     assert silver_transform_state_path(str(silver_root)).exists()
-    assert (Path(parquet_file).parent / ".write.lock").exists()
 
 
 def test_transform_l2_bronze_to_silver_processes_only_changed_bronze_partitions(tmp_path: Path) -> None:

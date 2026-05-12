@@ -19,7 +19,7 @@ Former OHLCV, standalone open-interest, standalone funding, research-report, and
 
 ```text
 CLI
-  -> Runtime config and process lock
+  -> Runtime config
   -> Async multi-symbol L2 polling
   -> Deribit public/get_order_book adapter
   -> L2Snapshot normalization
@@ -37,6 +37,7 @@ Lake transform
   -> Monthly silver Parquet, JSON metadata, and PNG profile artifacts
   -> gold-builder CLI command
   -> Polars Silver-to-Gold M1 aggregation
+  -> Optional missing-minute numeric fill from adjacent Gold minute averages
   -> Versioned full-timeframe Gold Parquet, JSON metadata, and PNG profile artifacts
   -> Incremental state files that skip unchanged Bronze/Silver inputs
 ```
@@ -47,11 +48,10 @@ Current top-level code layout:
 api/
   constants.py  # shared command names and runtime artifact names
   cli.py        # CLI parser, run orchestration, output shaping
-  runtime.py    # logging, process lock, concurrency config
+  runtime.py    # logging and concurrency config
 ingestion/
   artifact_state.py
   config.py
-  file_lock.py
   http_client.py
   l2.py
   lake.py
@@ -133,14 +133,13 @@ The production cron setup runs the three data-layer builders once per minute fro
 * * * * * cd /home/vcs/git/crypto-l2-loader && .venv/bin/python main.py gold-builder
 ```
 
-| Job | Purpose | Reads | Writes | Log File | Lock File |
-|---|---|---|---|---|---|
-| `bronze-builder` | Poll Deribit REST L2 snapshots for BTC, ETH, and SOL. | Deribit public order book API. | Daily Bronze Parquet partitions under `lake/bronze/`. | `.logs/bronze-builder.log` | `/tmp/crypto-l2-loader-bronze-builder.lock` |
-| `silver-builder` | Transform changed Bronze snapshots into fixed-width Silver snapshot feature rows. | `lake/bronze/` | Monthly Silver Parquet, JSON metadata, PNG profile artifacts, and `_silver_transform_state.json` under `lake/silver/`. | `.logs/silver-builder.log` | `/tmp/crypto-l2-loader-silver-builder.lock` |
-| `gold-builder` | Aggregate changed Silver symbol partitions into dense M1 Gold datasets. | `lake/silver/` | Versioned timeframe Parquet, JSON metadata, PNG profile artifacts, and `_gold_transform_state.json` under `lake/gold/`. | `.logs/gold-builder.log` | `/tmp/crypto-l2-loader-gold-builder.lock` |
+| Job | Purpose | Reads | Writes | Log File |
+|---|---|---|---|---|
+| `bronze-builder` | Poll Deribit REST L2 snapshots for BTC, ETH, and SOL. | Deribit public order book API. | Daily Bronze Parquet partitions under `lake/bronze/`. | `.logs/bronze-builder.log` |
+| `silver-builder` | Transform changed Bronze snapshots into fixed-width Silver snapshot feature rows. | `lake/bronze/` | Monthly Silver Parquet, JSON metadata, PNG profile artifacts, and `_silver_transform_state.json` under `lake/silver/`. | `.logs/silver-builder.log` |
+| `gold-builder` | Aggregate changed Silver symbol partitions into dense M1 Gold datasets. | `lake/silver/` | Versioned timeframe Parquet, JSON metadata, PNG profile artifacts, and `_gold_transform_state.json` under `lake/gold/`. | `.logs/gold-builder.log` |
 
-Each job uses a non-blocking single-instance lock and exits fast when a previous run is still active. Logs rotate weekly, and rotated logs are kept indefinitely by default.
-Lake partition writers also take local `.write.lock` files around read/merge/write replacement steps so accidental concurrent writers do not interleave updates inside the same partition.
+Jobs do not use process-level serialization, so overlapping scheduled launches are allowed. Logs rotate weekly, and rotated logs are kept indefinitely by default.
 
 ## Usage
 
@@ -211,7 +210,7 @@ Transform Bronze L2 snapshots into monthly Silver snapshot feature artifacts:
 python main.py silver-builder
 ```
 
-The Silver job logs to `.logs/silver-builder.log` by default and uses `/tmp/crypto-l2-loader-silver-builder.lock` to avoid overlapping transforms.
+The Silver job logs to `.logs/silver-builder.log` by default.
 It records Bronze parquet content fingerprints in `lake/silver/_silver_transform_state.json`; subsequent runs read and merge only Bronze partition files whose content changed since the prior successful run.
 
 Each Silver month partition writes three artifacts. The parquet file is named by month, and the metadata/plot files use the same month marker:
@@ -234,6 +233,7 @@ python main.py gold-builder [options]
 | `--gold-lake-root GOLD_LAKE_ROOT` | Root directory for Gold artifact output files. Defaults to `lake/gold`. |
 | `--expected-snapshots-per-minute EXPECTED` | Expected Silver snapshots per minute for quality coverage. Defaults to `6`. |
 | `--completeness-threshold THRESHOLD` | Minimum coverage ratio for a complete minute. Defaults to `0.8`. |
+| `--fill-missing-minutes`, `--no-fill-missing-minutes` | Fill missing Gold numeric feature values with adjacent-minute averages. Defaults to disabled. |
 | `--plot`, `--no-plot` | Enable or suppress Gold PNG profile generation. Defaults to enabled. |
 | `--manifest`, `--no-manifest` | Enable or suppress Gold JSON metadata manifest generation. Defaults to enabled. |
 | `--json-output`, `--no-json-output` | Enable or suppress JSON output. Logs are still emitted. |
@@ -245,6 +245,7 @@ python main.py gold-builder
 ```
 
 Gold is M1-only. Each dataset is materialized on the full one-minute scale from its lowest observed minute through its latest observed minute. Observed minutes use first/max/min/last/mean/std semantics inside the minute. Missing minutes are written as explicit rows with `snapshot_count = 0`, `coverage_ratio = 0.0`, `is_complete_minute = false`, `quality_flags = ["missing_minute"]`, and numeric feature values set to `NaN`; values are not forward-filled. With the default quality policy, `expected_snapshots_per_minute = 6`, `coverage_ratio = snapshot_count / 6`, and `is_complete_minute = coverage_ratio >= 0.8`.
+When `--fill-missing-minutes` is enabled, missing Gold rows keep `snapshot_count = 0`, `coverage_ratio = 0.0`, and `is_complete_minute = false`, but numeric feature values are replaced by the average of the immediately preceding and following non-missing Gold minutes. Filled rows add `filled_neighbor_average` to `quality_flags`.
 The Gold builder records Silver parquet content fingerprints by symbol in `lake/gold/_gold_transform_state.json`. Unchanged symbols are skipped; changed symbols are rebuilt from all Silver files for that symbol so each emitted Gold artifact remains a full timeframe dataset.
 
 For each exchange, instrument type, base asset, source symbol, depth, and timeframe, Gold writes a full versioned dataset at the `timeframe=1m` leaf. The three artifacts share the same reproducibility basename:
@@ -259,7 +260,7 @@ The JSON metadata contains dataset-level and feature-level metadata, including d
 
 The PNG profile uses the same basename. It plots all numeric Gold features as feature rows: line plots on the left panel and dark distribution histograms on the right panel. Line plots use at most 3,000 evenly spaced rows representing the full time scale; Parquet and JSON artifacts keep the complete dataset. Missing minutes are visible as broken line segments caused by `NaN` values and as red shaded spans. The plot header carries key manifest metadata, while each feature subplot shows only a compact left-side metadata window with feature name, time range, and row statistics.
 
-The Gold job logs to `.logs/gold-builder.log` by default and uses `/tmp/crypto-l2-loader-gold-builder.lock` to avoid overlapping transforms.
+The Gold job logs to `.logs/gold-builder.log` by default and allows overlapping transform launches.
 
 Validate symbols before adding them to cron:
 
@@ -326,10 +327,9 @@ lake/gold/
 |---|---|
 | `api/constants.py` | Shared command names and runtime artifact paths. |
 | `api/cli.py` | CLI parsing, builder orchestration, JSON output, parquet/artifact dispatch, and run logging. |
-| `api/runtime.py` | Process locking, logging setup, and concurrency config. |
+| `api/runtime.py` | Logging setup and concurrency config. |
 | `ingestion/artifact_state.py` | Content fingerprints and atomic JSON state files for incremental transforms. |
 | `ingestion/config.py` | Deterministic `config.yaml` loading and typed config accessors. |
-| `ingestion/file_lock.py` | Local exclusive file locks used around partition artifact writes. |
 | `ingestion/http_client.py` | Minimal JSON HTTP client with retries and cached per-process default settings. |
 | `ingestion/exchanges/deribit_l2.py` | Deribit order book adapter and symbol normalization. |
 | `ingestion/l2.py` | L2 dataclasses, async polling, and snapshot normalization. |
@@ -396,7 +396,7 @@ Gold M1 rows are derived from Silver:
 | `bid_volume_N_mean`, `ask_volume_N_mean` | Mean cumulative book size for each depth window. |
 | `book_pressure_N_mean` | Mean `bid_volume_N / (bid_volume_N + ask_volume_N)` for each depth window. |
 | `mark_price_last`, `index_price_last`, `open_interest_last`, `funding_rate_last` | Last market fields in the minute. |
-| `is_complete_minute`, `quality_flags` | Gold quality status. Missing scale rows use `quality_flags = ["missing_minute"]`. |
+| `is_complete_minute`, `quality_flags` | Gold quality status. Missing scale rows use `quality_flags = ["missing_minute"]`; optional filled rows also include `filled_neighbor_average`. |
 
 ## Testing
 
@@ -421,6 +421,7 @@ make check
 - Parquet persistence is local-file based and does not include a database sink.
 - Failed per-symbol fetches inside a polling tick are logged, isolated, and skipped for that tick.
 - Incremental transform state is local to one lake root and is not a distributed metadata catalog.
+- Overlapping local writer processes can race when they write the same artifact path at the same time.
 
 ## Future Improvements
 

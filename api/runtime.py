@@ -1,10 +1,8 @@
-"""Runtime helpers for CLI locking and logging."""
+"""Runtime helpers for CLI logging and concurrency settings."""
 
 from __future__ import annotations
 
-import fcntl
 import logging
-import os
 from logging.handlers import TimedRotatingFileHandler
 from pathlib import Path
 
@@ -15,45 +13,6 @@ DEFAULT_LOG_DIR = ".logs"
 DEFAULT_LOG_ROTATION_DAYS = 7
 DEFAULT_LOG_BACKUP_COUNT = 0
 DEFAULT_FETCH_CONCURRENCY = 8
-
-
-class SingleInstanceError(RuntimeError):
-    """Raised when another CLI instance is already running."""
-
-
-class SingleInstanceLock:
-    """Non-blocking process lock backed by a lock file.
-
-    Example:
-        ```python
-        with SingleInstanceLock("/tmp/crypto-l2-loader-bronze-builder.lock"):
-            run_loader()
-        ```
-    """
-
-    def __init__(self, lock_path: str) -> None:
-        self.lock_path = Path(lock_path)
-        self._fd: int | None = None
-
-    def __enter__(self) -> SingleInstanceLock:
-        self.lock_path.parent.mkdir(parents=True, exist_ok=True)
-        self._fd = os.open(self.lock_path, os.O_CREAT | os.O_RDWR, 0o644)
-        try:
-            fcntl.flock(self._fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError as exc:
-            os.close(self._fd)
-            self._fd = None
-            raise SingleInstanceError("Another crypto-l2-loader instance is already running. Exiting.") from exc
-        os.ftruncate(self._fd, 0)
-        os.write(self._fd, str(os.getpid()).encode("utf-8"))
-        return self
-
-    def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
-        if self._fd is None:
-            return
-        fcntl.flock(self._fd, fcntl.LOCK_UN)
-        os.close(self._fd)
-        self._fd = None
 
 
 def _safe_log_module_name(module_name: str) -> str:

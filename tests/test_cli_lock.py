@@ -1,8 +1,7 @@
-"""Tests for L2 CLI parsing and single-instance locking."""
+"""Tests for L2 CLI parsing, runtime logging, and builder dispatch."""
 
 from __future__ import annotations
 
-import fcntl
 import json
 import logging
 from datetime import UTC, datetime
@@ -12,7 +11,6 @@ from pathlib import Path
 import pytest
 
 from api import cli
-from api.cli import SingleInstanceError, SingleInstanceLock
 from api.constants import BRONZE_BUILDER_COMMAND, GOLD_BUILDER_COMMAND, SILVER_BUILDER_COMMAND
 from api.runtime import configure_logging
 from ingestion.config import Config
@@ -69,33 +67,6 @@ def _config(
             "json_output": json_output,
         },
     }
-
-
-def test_single_instance_lock_creates_lock_file(tmp_path: Path) -> None:
-    """Verify the process lock writes a pid file while held."""
-
-    lock_file = tmp_path / "test.lock"
-
-    with SingleInstanceLock(str(lock_file)):
-        assert lock_file.exists()
-        content = lock_file.read_text().strip()
-        assert content.isdigit()
-
-
-def test_single_instance_lock_raises_on_contention(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    """Verify the process lock fails fast when another instance owns it."""
-
-    lock_file = tmp_path / "test.lock"
-
-    def fake_flock(fd: int, operation: int) -> None:
-        del fd, operation
-        raise BlockingIOError("locked")
-
-    monkeypatch.setattr(fcntl, "flock", fake_flock)
-
-    with pytest.raises(SingleInstanceError):
-        with SingleInstanceLock(str(lock_file)):
-            pass
 
 
 def test_configure_logging_rotates_weekly_and_keeps_old_logs(tmp_path: Path) -> None:
@@ -289,58 +260,11 @@ def test_main_validate_symbols_outputs_json(
     assert [item["symbol"] for item in output["symbols"]] == ["BTC", "SOL"]
 
 
-def test_main_loader_l2_uses_single_instance_lock(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Verify bronze-builder exits when the single-instance lock is held."""
-
-    class Locked:
-        """Test double that simulates an already-running bronze-builder."""
-
-        def __init__(self, lock_path: str) -> None:
-            del lock_path
-
-        def __enter__(self) -> None:
-            raise SingleInstanceError("loader already running")
-
-        def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
-            del exc_type, exc, tb
-
-    monkeypatch.setattr(cli, "SingleInstanceLock", Locked)
-    monkeypatch.setattr(
-        "sys.argv",
-        [
-            "main.py",
-            BRONZE_BUILDER_COMMAND,
-            "--symbols",
-            "BTC",
-            "--snapshot-count",
-            "1",
-            "--poll-interval-s",
-            "0",
-            "--no-json-output",
-        ],
-    )
-
-    with pytest.raises(SystemExit, match="loader already running"):
-        cli.main()
-
-
 def test_main_loader_l2_outputs_raw_snapshots(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     """Verify the CLI writes raw snapshots to JSON output."""
-
-    class NoopLock:
-        """Test double that allows bronze-builder to run."""
-
-        def __init__(self, lock_path: str) -> None:
-            del lock_path
-
-        def __enter__(self) -> None:
-            return None
-
-        def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
-            del exc_type, exc, tb
 
     snapshot = L2Snapshot(
         exchange="deribit",
@@ -356,7 +280,6 @@ def test_main_loader_l2_outputs_raw_snapshots(
         current_funding=0.00001,
     )
 
-    monkeypatch.setattr(cli, "SingleInstanceLock", NoopLock)
     monkeypatch.setattr(cli, "fetch_l2_snapshots_for_symbols", lambda **kwargs: {"BTC": [snapshot]})
     monkeypatch.setattr(
         "sys.argv",
@@ -386,18 +309,6 @@ def test_main_loader_l2_persists_raw_snapshots_to_lake(
 ) -> None:
     """Verify the parquet save flag writes raw snapshots with the requested depth."""
 
-    class NoopLock:
-        """Test double that allows bronze-builder to run."""
-
-        def __init__(self, lock_path: str) -> None:
-            del lock_path
-
-        def __enter__(self) -> None:
-            return None
-
-        def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
-            del exc_type, exc, tb
-
     snapshot = L2Snapshot(
         exchange="deribit",
         symbol="BTC-PERPETUAL",
@@ -417,7 +328,6 @@ def test_main_loader_l2_persists_raw_snapshots_to_lake(
         calls.append(kwargs)
         return ["/tmp/lake/bronze/dataset_type=l2_snapshot/data.parquet"]
 
-    monkeypatch.setattr(cli, "SingleInstanceLock", NoopLock)
     monkeypatch.setattr(cli, "fetch_l2_snapshots_for_symbols", lambda **kwargs: {"BTC": [snapshot]})
     monkeypatch.setattr(cli, "save_l2_snapshot_parquet_lake", fake_save_l2_snapshot_parquet_lake)
     monkeypatch.setattr(
@@ -451,18 +361,6 @@ def test_main_silver_builder_outputs_written_files(
 ) -> None:
     """Verify silver-builder runs the Bronze-to-Silver transform."""
 
-    class NoopLock:
-        """Test double that allows silver-builder to run."""
-
-        def __init__(self, lock_path: str) -> None:
-            del lock_path
-
-        def __enter__(self) -> None:
-            return None
-
-        def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
-            del exc_type, exc, tb
-
     calls: list[dict[str, object]] = []
     artifact_files = [
         "/tmp/lake/silver/dataset_type=l2_snapshot_features/month=2026-05/2026-05.parquet",
@@ -474,7 +372,6 @@ def test_main_silver_builder_outputs_written_files(
         calls.append(kwargs)
         return artifact_files
 
-    monkeypatch.setattr(cli, "SingleInstanceLock", NoopLock)
     monkeypatch.setattr(cli, "transform_l2_bronze_to_silver", fake_transform_l2_bronze_to_silver)
     monkeypatch.setattr(
         "sys.argv",
@@ -506,50 +403,11 @@ def test_main_silver_builder_outputs_written_files(
     ]
 
 
-def test_main_silver_builder_uses_single_instance_lock(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Verify silver-builder exits when the single-instance lock is held."""
-
-    class Locked:
-        """Test double that simulates an already-running silver-builder."""
-
-        def __init__(self, lock_path: str) -> None:
-            del lock_path
-
-        def __enter__(self) -> None:
-            raise SingleInstanceError("silver builder already running")
-
-        def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
-            del exc_type, exc, tb
-
-    monkeypatch.setattr(cli, "SingleInstanceLock", Locked)
-    monkeypatch.setattr(
-        "sys.argv",
-        [
-            "main.py",
-            SILVER_BUILDER_COMMAND,
-            "--no-json-output",
-        ],
-    )
-
-    with pytest.raises(SystemExit, match="silver builder already running"):
-        cli.main()
-
-
 def test_main_silver_builder_respects_plot_and_manifest_flags(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     """Verify silver-builder passes plot and manifest flags through to the transform."""
-
-    class NoopLock:
-        def __init__(self, lock_path: str) -> None:
-            del lock_path
-
-        def __enter__(self) -> None:
-            return None
-
-        def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
-            del exc_type, exc, tb
 
     calls: list[dict[str, object]] = []
     artifact_files = ["/tmp/lake/silver/dataset_type=l2_snapshot_features/month=2026-05/2026-05.parquet"]
@@ -558,7 +416,6 @@ def test_main_silver_builder_respects_plot_and_manifest_flags(
         calls.append(kwargs)
         return artifact_files
 
-    monkeypatch.setattr(cli, "SingleInstanceLock", NoopLock)
     monkeypatch.setattr(cli, "transform_l2_bronze_to_silver", fake_transform_l2_bronze_to_silver)
     monkeypatch.setattr(
         "sys.argv",
@@ -595,25 +452,12 @@ def test_main_gold_builder_outputs_artifact_files(
 ) -> None:
     """Verify gold-builder runs the Silver-to-Gold transform."""
 
-    class NoopLock:
-        """Test double that allows gold-builder to run."""
-
-        def __init__(self, lock_path: str) -> None:
-            del lock_path
-
-        def __enter__(self) -> None:
-            return None
-
-        def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
-            del exc_type, exc, tb
-
     calls: list[dict[str, object]] = []
 
     def fake_transform_l2_silver_to_gold(**kwargs: object) -> list[str]:
         calls.append(kwargs)
         return ["/tmp/lake/gold/BTC_hash_commit.parquet"]
 
-    monkeypatch.setattr(cli, "SingleInstanceLock", NoopLock)
     monkeypatch.setattr(cli, "transform_l2_silver_to_gold", fake_transform_l2_silver_to_gold)
     monkeypatch.setattr(
         "sys.argv",
@@ -644,6 +488,7 @@ def test_main_gold_builder_outputs_artifact_files(
             "completeness_threshold": 0.8,
             "plot": True,
             "manifest": True,
+            "fill_missing_minutes": False,
         }
     ]
 
@@ -654,23 +499,12 @@ def test_main_gold_builder_respects_plot_and_manifest_flags(
 ) -> None:
     """Verify gold-builder passes plot and manifest flags through to the transform."""
 
-    class NoopLock:
-        def __init__(self, lock_path: str) -> None:
-            del lock_path
-
-        def __enter__(self) -> None:
-            return None
-
-        def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
-            del exc_type, exc, tb
-
     calls: list[dict[str, object]] = []
 
     def fake_transform_l2_silver_to_gold(**kwargs: object) -> list[str]:
         calls.append(kwargs)
         return ["/tmp/lake/gold/BTC_hash_commit.parquet"]
 
-    monkeypatch.setattr(cli, "SingleInstanceLock", NoopLock)
     monkeypatch.setattr(cli, "transform_l2_silver_to_gold", fake_transform_l2_silver_to_gold)
     monkeypatch.setattr(
         "sys.argv",
@@ -685,6 +519,7 @@ def test_main_gold_builder_respects_plot_and_manifest_flags(
             "6",
             "--completeness-threshold",
             "0.8",
+            "--fill-missing-minutes",
             "--no-plot",
             "--no-manifest",
         ],
@@ -700,34 +535,6 @@ def test_main_gold_builder_respects_plot_and_manifest_flags(
             "completeness_threshold": 0.8,
             "plot": False,
             "manifest": False,
+            "fill_missing_minutes": True,
         }
     ]
-
-
-def test_main_gold_builder_uses_single_instance_lock(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Verify gold-builder exits when the single-instance lock is held."""
-
-    class Locked:
-        """Test double that simulates an already-running gold-builder."""
-
-        def __init__(self, lock_path: str) -> None:
-            del lock_path
-
-        def __enter__(self) -> None:
-            raise SingleInstanceError("gold builder already running")
-
-        def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
-            del exc_type, exc, tb
-
-    monkeypatch.setattr(cli, "SingleInstanceLock", Locked)
-    monkeypatch.setattr(
-        "sys.argv",
-        [
-            "main.py",
-            GOLD_BUILDER_COMMAND,
-            "--no-json-output",
-        ],
-    )
-
-    with pytest.raises(SystemExit, match="gold builder already running"):
-        cli.main()
