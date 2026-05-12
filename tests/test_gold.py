@@ -11,14 +11,17 @@ import polars as pl
 
 from ingestion.gold import (
     base_asset_symbol,
+    dataframe_content_hash,
     gold_l2_m1_dataset_path,
     gold_l2_m1_from_silver,
     gold_metadata,
     gold_plot_feature_metadata_label,
     gold_plot_metadata_lines,
     gold_plot_sample,
+    gold_transform_state_path,
     silver_parquet_files,
     silver_source_summary,
+    transform_l2_silver_to_gold,
     write_gold_l2_m1_artifacts,
 )
 
@@ -74,6 +77,23 @@ def _sample_silver_frame() -> pl.DataFrame:
             _silver_row(second=40, mid_price=100.2),
         ]
     )
+
+
+def _write_silver_partition(root: Path, symbol: str, rows: list[dict[str, object]]) -> Path:
+    """Write a test Silver month partition."""
+
+    partition = (
+        root
+        / "dataset_type=l2_snapshot_features"
+        / "exchange=deribit"
+        / "instrument_type=perp"
+        / f"symbol={symbol}"
+        / "month=2026-05"
+    )
+    partition.mkdir(parents=True, exist_ok=True)
+    path = partition / "2026-05.parquet"
+    pl.DataFrame(rows).write_parquet(path)
+    return path
 
 
 def test_gold_l2_m1_from_silver_computes_ohlc_and_quality() -> None:
@@ -170,6 +190,8 @@ def test_write_gold_l2_m1_artifacts_writes_parquet_json_and_png(tmp_path: Path) 
     assert metadata["timeframe"] == "1m"
     assert metadata["row_count"] == 1
     assert metadata["column_count"] == len(gold.columns)
+    assert metadata["gold_content_hash"] == dataframe_content_hash(gold)
+    assert metadata["source_fingerprint_hash"]
     assert metadata["source_silver_dataset_summaries"]["source_symbols"] == [
         {"row_count": 5, "source_symbol": "BTC-PERPETUAL"}
     ]
@@ -200,6 +222,37 @@ def test_write_gold_l2_m1_artifacts_skips_manifest_and_plot_when_disabled(tmp_pa
     assert Path(files[0]).exists()
     assert not any(path.name.endswith(".json") for path in Path(tmp_path).rglob("*.json"))
     assert not any(path.name.endswith(".png") for path in Path(tmp_path).rglob("*.png"))
+    assert (Path(files[0]).parent / ".write.lock").exists()
+
+
+def test_write_gold_l2_m1_artifacts_hash_changes_when_output_data_changes(tmp_path: Path) -> None:
+    """Verify artifact basenames are tied to actual Gold output content."""
+
+    silver = _sample_silver_frame()
+    changed_silver = pl.DataFrame(
+        [
+            _silver_row(second=0, mid_price=200.0),
+            _silver_row(second=10, mid_price=201.0),
+        ]
+    )
+    first_files = write_gold_l2_m1_artifacts(
+        gold=gold_l2_m1_from_silver(silver),
+        gold_lake_root=str(tmp_path),
+        source_summary=silver_source_summary(silver),
+        git_commit_hash="abcdef1234567890",
+        plot=False,
+        manifest=False,
+    )
+    second_files = write_gold_l2_m1_artifacts(
+        gold=gold_l2_m1_from_silver(changed_silver),
+        gold_lake_root=str(tmp_path),
+        source_summary=silver_source_summary(changed_silver),
+        git_commit_hash="abcdef1234567890",
+        plot=False,
+        manifest=False,
+    )
+
+    assert Path(first_files[0]).stem != Path(second_files[0]).stem
 
 
 def test_gold_plot_metadata_lines_include_manifest_context() -> None:
@@ -356,3 +409,77 @@ def test_silver_parquet_files_prefers_month_named_files_over_legacy(tmp_path: Pa
     month_path.touch()
 
     assert silver_parquet_files(str(tmp_path)) == [month_path]
+
+
+def test_transform_l2_silver_to_gold_rebuilds_only_changed_symbols(tmp_path: Path) -> None:
+    """Verify Gold transform state skips unchanged symbol inputs."""
+
+    silver_root = tmp_path / "silver"
+    gold_root = tmp_path / "gold"
+    btc_rows = [_silver_row(second=0, mid_price=100.0, symbol="BTC-PERPETUAL")]
+    eth_rows = [_silver_row(second=0, mid_price=200.0, symbol="ETH-PERPETUAL")]
+    _write_silver_partition(silver_root, "BTC-PERPETUAL", btc_rows)
+    eth_path = _write_silver_partition(silver_root, "ETH-PERPETUAL", eth_rows)
+
+    first_files = transform_l2_silver_to_gold(
+        silver_lake_root=str(silver_root),
+        gold_lake_root=str(gold_root),
+        plot=False,
+        manifest=False,
+    )
+    second_files = transform_l2_silver_to_gold(
+        silver_lake_root=str(silver_root),
+        gold_lake_root=str(gold_root),
+        plot=False,
+        manifest=False,
+    )
+
+    _write_silver_partition(
+        silver_root,
+        "ETH-PERPETUAL",
+        [*eth_rows, _silver_row(second=10, mid_price=201.0, symbol="ETH-PERPETUAL")],
+    )
+    third_files = transform_l2_silver_to_gold(
+        silver_lake_root=str(silver_root),
+        gold_lake_root=str(gold_root),
+        plot=False,
+        manifest=False,
+    )
+
+    assert len(first_files) == 2
+    assert second_files == []
+    assert len(third_files) == 1
+    assert "/symbol=ETH-PERPETUAL/" in third_files[0]
+    assert gold_transform_state_path(str(gold_root)).exists()
+    assert eth_path.exists()
+
+
+def test_transform_l2_silver_to_gold_rebuilds_when_quality_policy_changes(tmp_path: Path) -> None:
+    """Verify transform settings are part of Gold incremental invalidation."""
+
+    silver_root = tmp_path / "silver"
+    gold_root = tmp_path / "gold"
+    _write_silver_partition(
+        silver_root,
+        "BTC-PERPETUAL",
+        [_silver_row(second=0, mid_price=100.0, symbol="BTC-PERPETUAL")],
+    )
+
+    first_files = transform_l2_silver_to_gold(
+        silver_lake_root=str(silver_root),
+        gold_lake_root=str(gold_root),
+        completeness_threshold=0.8,
+        plot=False,
+        manifest=False,
+    )
+    second_files = transform_l2_silver_to_gold(
+        silver_lake_root=str(silver_root),
+        gold_lake_root=str(gold_root),
+        completeness_threshold=0.1,
+        plot=False,
+        manifest=False,
+    )
+
+    assert len(first_files) == 1
+    assert len(second_files) == 1
+    assert Path(first_files[0]).stem != Path(second_files[0]).stem

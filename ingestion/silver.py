@@ -10,10 +10,14 @@ from typing import Any, cast
 
 import polars as pl
 
+from ingestion.artifact_state import file_fingerprints, load_json_state, write_json_state
+from ingestion.file_lock import FileLock
+
 SILVER_L2_FEATURE_DATASET_TYPE = "l2_snapshot_features"
 SILVER_SCHEMA_VERSION = "v1"
 DEPTH_WINDOWS = (1, 5, 10, 20, 50)
 SILVER_NATURAL_KEY = ["exchange", "symbol", "instrument_type", "source", "depth", "ts_event"]
+SILVER_STATE_FILE_NAME = "_silver_transform_state.json"
 
 SilverPartitionKey = tuple[str, str, str, str]
 
@@ -44,18 +48,64 @@ def transform_l2_bronze_to_silver(
     if depth <= 0:
         raise ValueError("depth must be positive")
 
-    bronze_files = sorted(Path(bronze_lake_root).glob("dataset_type=l2_snapshot/**/*.parquet"))
+    bronze_files = bronze_parquet_files(bronze_lake_root)
     if not bronze_files:
         return []
 
-    bronze = pl.read_parquet([str(path) for path in bronze_files])
+    state_path = silver_transform_state_path(silver_lake_root)
+    current_fingerprints = file_fingerprints(bronze_files)
+    state = load_json_state(state_path)
+    previous_fingerprints = state.get("bronze_inputs", {})
+    transform_settings_unchanged = state.get("depth") == depth
+    if transform_settings_unchanged and previous_fingerprints == current_fingerprints:
+        return []
+
+    changed_files = []
+    deleted_inputs = (
+        set(previous_fingerprints) - set(current_fingerprints) if isinstance(previous_fingerprints, dict) else set()
+    )
+    for path in bronze_files:
+        resolved_path = str(path.resolve())
+        if (
+            not transform_settings_unchanged
+            or deleted_inputs
+            or not isinstance(previous_fingerprints, dict)
+            or previous_fingerprints.get(resolved_path) != current_fingerprints[resolved_path]
+        ):
+            changed_files.append(path)
+    bronze = pl.read_parquet([str(path) for path in changed_files])
     silver = silver_l2_features_from_bronze(bronze=bronze, depth=depth)
-    return save_silver_l2_snapshot_features(
+    written_files = save_silver_l2_snapshot_features(
         silver=silver,
         lake_root=silver_lake_root,
         plot=plot,
         manifest=manifest,
     )
+    write_json_state(
+        state_path,
+        {
+            "schema_version": "v1",
+            "bronze_lake_root": str(Path(bronze_lake_root).resolve()),
+            "silver_lake_root": str(Path(silver_lake_root).resolve()),
+            "depth": depth,
+            "bronze_inputs": current_fingerprints,
+            "last_changed_inputs": [str(path.resolve()) for path in changed_files],
+            "last_written_files": written_files,
+        },
+    )
+    return written_files
+
+
+def bronze_parquet_files(bronze_lake_root: str) -> list[Path]:
+    """Return Bronze parquet inputs in deterministic order."""
+
+    return sorted(Path(bronze_lake_root).glob("dataset_type=l2_snapshot/**/*.parquet"))
+
+
+def silver_transform_state_path(silver_lake_root: str) -> Path:
+    """Return the Silver incremental transform state path."""
+
+    return Path(silver_lake_root) / SILVER_STATE_FILE_NAME
 
 
 def silver_l2_features_from_bronze(bronze: pl.DataFrame, depth: int = 50) -> pl.DataFrame:
@@ -181,26 +231,28 @@ def save_silver_l2_snapshot_features(
         metadata_path = part_dir / f"{month_partition}.json"
         plot_path = part_dir / f"{month_partition}.png"
         legacy_file_path = part_dir / "data.parquet"
+        lock_path = part_dir / ".write.lock"
 
-        output = partition
-        existing_file_path = file_path if file_path.exists() else legacy_file_path
-        if existing_file_path.exists():
-            output = pl.concat([pl.read_parquet(existing_file_path), partition], how="vertical")
+        with FileLock(lock_path):
+            output = partition
+            existing_file_path = file_path if file_path.exists() else legacy_file_path
+            if existing_file_path.exists():
+                output = pl.concat([pl.read_parquet(existing_file_path), partition], how="vertical")
 
-        output = output.unique(subset=SILVER_NATURAL_KEY, keep="last").sort("ts_event")
-        output.write_parquet(staging_path)
-        staging_path.replace(file_path)
+            output = output.unique(subset=SILVER_NATURAL_KEY, keep="last").sort("ts_event")
+            output.write_parquet(staging_path)
+            staging_path.replace(file_path)
 
-        written_files.append(str(file_path.resolve()))
-        if manifest:
-            metadata_path.write_text(
-                json.dumps(silver_artifact_metadata(output), indent=2, sort_keys=True),
-                encoding="utf-8",
-            )
-            written_files.append(str(metadata_path.resolve()))
-        if plot:
-            write_silver_profile_png(silver=output, path=plot_path)
-            written_files.append(str(plot_path.resolve()))
+            written_files.append(str(file_path.resolve()))
+            if manifest:
+                metadata_path.write_text(
+                    json.dumps(silver_artifact_metadata(output), indent=2, sort_keys=True),
+                    encoding="utf-8",
+                )
+                written_files.append(str(metadata_path.resolve()))
+            if plot:
+                write_silver_profile_png(silver=output, path=plot_path)
+                written_files.append(str(plot_path.resolve()))
 
     return sorted(written_files)
 

@@ -13,6 +13,9 @@ from typing import Any
 
 import polars as pl
 
+from ingestion.artifact_state import file_fingerprints, load_json_state, write_json_state
+from ingestion.file_lock import FileLock
+
 GOLD_FEATURE_SET_VERSION = "gold_l2_m1_v1"
 GOLD_L2_M1_DATASET_TYPE = "l2_m1_features"
 GOLD_TIMEFRAME = "1m"
@@ -70,6 +73,7 @@ GOLD_NUMERIC_FEATURES = [
     "funding_rate_last",
 ]
 GOLD_COLUMNS = [*GOLD_KEY_COLUMNS, *GOLD_METADATA_COLUMNS, *GOLD_NUMERIC_FEATURES]
+GOLD_STATE_FILE_NAME = "_gold_transform_state.json"
 
 
 @dataclass(frozen=True)
@@ -109,27 +113,75 @@ def transform_l2_silver_to_gold(
     if not silver_files:
         return []
 
-    silver = pl.read_parquet([str(path) for path in silver_files])
-    gold = gold_l2_m1_from_silver(
-        silver=silver,
-        expected_snapshots_per_minute=expected_snapshots_per_minute,
-        completeness_threshold=completeness_threshold,
-        feature_set_version=feature_set_version,
-    )
-    source_summary = silver_source_summary(silver)
+    state_path = gold_transform_state_path(gold_lake_root)
+    current_fingerprints = file_fingerprints(silver_files)
+    state = load_json_state(state_path)
+    symbol_state = state.get("symbols", {})
+    symbol_files = silver_files_by_symbol(silver_files)
     git_commit_hash = current_git_commit_hash()
-    return write_gold_l2_m1_artifacts(
-        gold=gold,
-        gold_lake_root=gold_lake_root,
-        source_summary=source_summary,
-        git_commit_hash=git_commit_hash,
-        expected_snapshots_per_minute=expected_snapshots_per_minute,
-        completeness_threshold=completeness_threshold,
-        feature_set_version=feature_set_version,
-        plot=plot,
-        manifest=manifest,
-        densify=False,
+    transform_settings_unchanged = (
+        state.get("expected_snapshots_per_minute") == expected_snapshots_per_minute
+        and state.get("completeness_threshold") == completeness_threshold
+        and state.get("feature_set_version") == feature_set_version
+        and state.get("git_commit_hash") == git_commit_hash
     )
+    changed_symbols = [
+        symbol
+        for symbol, paths in sorted(symbol_files.items())
+        if not transform_settings_unchanged
+        or not isinstance(symbol_state, dict)
+        or symbol_state.get(symbol, {}).get("silver_inputs")
+        != {str(path.resolve()): current_fingerprints[str(path.resolve())] for path in paths}
+    ]
+    if not changed_symbols:
+        return []
+
+    written_files: list[str] = []
+    next_symbol_state = symbol_state if isinstance(symbol_state, dict) else {}
+    for symbol in changed_symbols:
+        paths = symbol_files[symbol]
+        symbol_fingerprints = {str(path.resolve()): current_fingerprints[str(path.resolve())] for path in paths}
+        silver = pl.read_parquet([str(path) for path in paths])
+        gold = gold_l2_m1_from_silver(
+            silver=silver,
+            expected_snapshots_per_minute=expected_snapshots_per_minute,
+            completeness_threshold=completeness_threshold,
+            feature_set_version=feature_set_version,
+        )
+        symbol_written_files = write_gold_l2_m1_artifacts(
+            gold=gold,
+            gold_lake_root=gold_lake_root,
+            source_summary=silver_source_summary(silver),
+            git_commit_hash=git_commit_hash,
+            expected_snapshots_per_minute=expected_snapshots_per_minute,
+            completeness_threshold=completeness_threshold,
+            feature_set_version=feature_set_version,
+            plot=plot,
+            manifest=manifest,
+            densify=False,
+            source_fingerprints=symbol_fingerprints,
+        )
+        written_files.extend(symbol_written_files)
+        next_symbol_state[symbol] = {
+            "silver_inputs": symbol_fingerprints,
+            "last_written_files": symbol_written_files,
+        }
+
+    write_json_state(
+        state_path,
+        {
+            "schema_version": "v1",
+            "silver_lake_root": str(Path(silver_lake_root).resolve()),
+            "gold_lake_root": str(Path(gold_lake_root).resolve()),
+            "expected_snapshots_per_minute": expected_snapshots_per_minute,
+            "completeness_threshold": completeness_threshold,
+            "feature_set_version": feature_set_version,
+            "git_commit_hash": git_commit_hash,
+            "changed_symbols": changed_symbols,
+            "symbols": next_symbol_state,
+        },
+    )
+    return sorted(written_files)
 
 
 def silver_parquet_files(silver_lake_root: str) -> list[Path]:
@@ -138,6 +190,31 @@ def silver_parquet_files(silver_lake_root: str) -> list[Path]:
     all_files = sorted(Path(silver_lake_root).glob("dataset_type=l2_snapshot_features/**/*.parquet"))
     month_named_dirs = {path.parent for path in all_files if path.name != "data.parquet"}
     return [path for path in all_files if path.name != "data.parquet" or path.parent not in month_named_dirs]
+
+
+def silver_files_by_symbol(silver_files: list[Path]) -> dict[str, list[Path]]:
+    """Group Silver parquet files by symbol partition."""
+
+    grouped: dict[str, list[Path]] = {}
+    for path in silver_files:
+        symbol = silver_symbol_from_path(path)
+        grouped.setdefault(symbol, []).append(path)
+    return {symbol: sorted(paths) for symbol, paths in sorted(grouped.items())}
+
+
+def silver_symbol_from_path(path: Path) -> str:
+    """Extract the symbol partition value from a Silver parquet path."""
+
+    for part in path.parts:
+        if part.startswith("symbol="):
+            return part.removeprefix("symbol=")
+    raise ValueError(f"Silver parquet path is missing symbol partition: {path}")
+
+
+def gold_transform_state_path(gold_lake_root: str) -> Path:
+    """Return the Gold incremental transform state path."""
+
+    return Path(gold_lake_root) / GOLD_STATE_FILE_NAME
 
 
 def gold_l2_m1_from_silver(
@@ -262,6 +339,7 @@ def write_gold_l2_m1_artifacts(
     plot: bool = True,
     manifest: bool = True,
     densify: bool = True,
+    source_fingerprints: dict[str, Any] | None = None,
 ) -> list[str]:
     """Write full versioned Gold datasets under lake-style timeframe leaves."""
 
@@ -275,6 +353,7 @@ def write_gold_l2_m1_artifacts(
     for symbol_frame in gold.partition_by(GOLD_DATASET_PARTITION_COLUMNS):
         identity = gold_dataset_identity(symbol_frame)
         source_symbol_summary = source_summary_for_symbol(source_summary, identity.symbol)
+        gold_content_hash = dataframe_content_hash(symbol_frame.select(GOLD_COLUMNS))
         hash_payload = {
             "dataset_type": GOLD_L2_M1_DATASET_TYPE,
             "feature_set_version": identity.feature_set_version,
@@ -287,6 +366,8 @@ def write_gold_l2_m1_artifacts(
             "completeness_threshold": completeness_threshold,
             "git_commit_hash": git_commit_hash,
             "source_summary": source_symbol_summary,
+            "source_fingerprints": source_fingerprints or {},
+            "gold_content_hash": gold_content_hash,
             "gold_schema": {name: str(dtype) for name, dtype in symbol_frame.schema.items()},
         }
         hash_string = stable_json_hash(hash_payload)
@@ -305,30 +386,34 @@ def write_gold_l2_m1_artifacts(
         parquet_path = dataset_dir / f"{basename}.parquet"
         json_path = dataset_dir / f"{basename}.json"
         png_path = dataset_dir / f"{basename}.png"
+        lock_path = dataset_dir / ".write.lock"
 
-        symbol_frame.write_parquet(parquet_path)
-        written_files.append(str(parquet_path.resolve()))
+        with FileLock(lock_path):
+            symbol_frame.write_parquet(parquet_path)
+            written_files.append(str(parquet_path.resolve()))
 
-        metadata: dict[str, Any] | None = None
-        if manifest or plot:
-            metadata = gold_metadata(
-                gold=symbol_frame,
-                source_summary=source_symbol_summary,
-                hash_string=hash_string,
-                git_commit_hash=git_commit_hash,
-                expected_snapshots_per_minute=expected_snapshots_per_minute,
-                completeness_threshold=completeness_threshold,
-                feature_set_version=identity.feature_set_version,
-            )
+            metadata: dict[str, Any] | None = None
+            if manifest or plot:
+                metadata = gold_metadata(
+                    gold=symbol_frame,
+                    source_summary=source_symbol_summary,
+                    hash_string=hash_string,
+                    git_commit_hash=git_commit_hash,
+                    expected_snapshots_per_minute=expected_snapshots_per_minute,
+                    completeness_threshold=completeness_threshold,
+                    feature_set_version=identity.feature_set_version,
+                    source_fingerprints=source_fingerprints or {},
+                    gold_content_hash=gold_content_hash,
+                )
 
-        if manifest:
-            json_path.write_text(json.dumps(metadata, indent=2, sort_keys=True), encoding="utf-8")
-            written_files.append(str(json_path.resolve()))
+            if manifest:
+                json_path.write_text(json.dumps(metadata, indent=2, sort_keys=True), encoding="utf-8")
+                written_files.append(str(json_path.resolve()))
 
-        if plot:
-            assert metadata is not None
-            write_gold_profile_png(gold=symbol_frame, metadata=metadata, path=png_path)
-            written_files.append(str(png_path.resolve()))
+            if plot:
+                assert metadata is not None
+                write_gold_profile_png(gold=symbol_frame, metadata=metadata, path=png_path)
+                written_files.append(str(png_path.resolve()))
 
     return sorted(written_files)
 
@@ -402,6 +487,8 @@ def gold_metadata(
     expected_snapshots_per_minute: int,
     completeness_threshold: float,
     feature_set_version: str,
+    source_fingerprints: dict[str, Any] | None = None,
+    gold_content_hash: str | None = None,
 ) -> dict[str, Any]:
     """Build JSON metadata for one gold artifact without filesystem paths."""
 
@@ -422,6 +509,8 @@ def gold_metadata(
         "timestamp_max": timestamp_max,
         "missing_minute_count": _missing_minute_count(gold),
         "source_silver_dataset_summaries": source_summary,
+        "source_fingerprint_hash": stable_json_hash({"source_fingerprints": source_fingerprints or {}}),
+        "gold_content_hash": gold_content_hash or dataframe_content_hash(gold.select(GOLD_COLUMNS)),
         "features": [_column_metadata(gold, column) for column in gold.columns],
     }
 
@@ -665,6 +754,16 @@ def stable_json_hash(payload: dict[str, Any]) -> str:
 
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()[:12]
+
+
+def dataframe_content_hash(frame: pl.DataFrame) -> str:
+    """Return a stable content hash for a Polars frame."""
+
+    sort_columns = [column for column in GOLD_KEY_COLUMNS if column in frame.columns]
+    payload_frame = frame.sort(sort_columns) if sort_columns else frame
+    payload = payload_frame.to_dicts()
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def source_summary_for_symbol(source_summary: dict[str, Any], symbol: str) -> dict[str, Any]:

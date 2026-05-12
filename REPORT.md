@@ -1,54 +1,80 @@
-# crypto-l2-loader Gold Refactor and Optimization Report
+# crypto-l2-loader Technical State Report
 
 ## Summary
 
-This update refactors the Gold transform and artifact layer into a dense, versioned M1 dataset workflow. Gold outputs now use a lake-style hierarchy, materialize the full one-minute time scale, preserve missing minutes explicitly, and generate bounded, metadata-rich profile plots.
+`crypto-l2-loader` is currently a focused Deribit Level 2 ingestion utility. It polls bounded REST order book snapshots, writes raw Bronze Parquet partitions, derives monthly Silver fixed-width L2 feature artifacts, and builds dense Gold M1 feature datasets.
 
-## Key Improvements
+The project is not a research-report or modeling repository. Its maintained scope is operational L2 ingestion and reproducible local-file lake transforms.
 
-- Refactored Gold artifact layout from flat root files to versioned timeframe dataset leaves:
-  - `dataset_type=l2_m1_features`
-  - `feature_set_version=gold_l2_m1_v1`
-  - `exchange`, `instrument_type`, `base_asset`, `symbol`, `depth`, and `timeframe=1m`
-- Materialized each Gold dataset on the full M1 time scale from the lowest observed minute through the latest observed minute.
-- Added explicit missing-minute rows with:
-  - `snapshot_count = 0`
-  - `coverage_ratio = 0.0`
-  - `is_complete_minute = false`
-  - `quality_flags = ["missing_minute"]`
-  - numeric Gold feature values set to `NaN`
-- Preserved no-forward-fill semantics for missing minutes.
-- Updated Gold manifests with dataset type, feature-set version, timeframe, missing-minute counts, and per-feature NaN counts.
-- Updated Gold PNG profiles:
-  - numeric line plots use at most 3,000 evenly spaced points across the full time scale
-  - histograms still use the complete feature series
-  - missing minutes appear as broken `NaN` line segments and red shaded spans
-  - the plot header carries key manifest metadata
-  - each feature subplot has a compact left-side metadata window with feature name, time range, and row statistics
-- Refactored and optimized Gold internals:
-  - centralized dataset identity with `GoldDatasetIdentity`
-  - reused shared Gold partition columns
-  - avoided duplicate source-summary filtering
-  - skipped duplicate densification in the normal transform-to-write path
-  - used Polars-native finite/NaN row statistics instead of Python value scans
+## Current Architecture
 
-## Testing and Validation
+- `api/cli.py` exposes `bronze-builder`, `silver-builder`, `gold-builder`, and `validate-symbols`.
+- `api/runtime.py` provides process-level job locks, logging, and bounded fetch concurrency.
+- `ingestion/exchanges/deribit_l2.py` adapts Deribit's public order book API into normalized payloads.
+- `ingestion/l2.py` defines `L2Snapshot`, async polling, and Bronze row normalization.
+- `ingestion/lake.py` writes idempotent daily Bronze Parquet partitions.
+- `ingestion/silver.py` transforms changed Bronze parquet inputs into monthly Silver feature artifacts.
+- `ingestion/gold.py` transforms changed Silver symbol partitions into full dense M1 Gold datasets.
+- `ingestion/artifact_state.py` stores content fingerprints for incremental transform state.
+- `ingestion/file_lock.py` provides partition-level exclusive file locks for artifact writers.
 
-- Ran focused Gold checks:
-  - `.venv/bin/python -m ruff check ingestion/gold.py tests/test_gold.py`
-  - `.venv/bin/python -m pytest tests/test_gold.py`
-- Ran the full test suite:
-  - `.venv/bin/python -m pytest`
-- Result: `53 passed`
+## Data Layers
 
-## Files Changed
+### Bronze
 
-- `ingestion/gold.py`
-- `README.md`
-- `REPORT.md`
-- `tests/test_gold.py`
+Bronze stores raw normalized L2 snapshots under daily partitions:
 
-## Notes
+```text
+lake/bronze/dataset_type=l2_snapshot/exchange=deribit/instrument_type=perp/symbol=.../depth=.../source=rest_order_book/month=YYYY-MM/date=YYYY-MM-DD/data.parquet
+```
 
-- The report is intentionally concise and focused on the current Gold implementation work.
-- No research or modeling artifacts were added.
+Rows are deduplicated by exchange, instrument type, symbol, depth, source, and event time. Writes use staging files, atomic replacement, and local `.write.lock` files.
+
+### Silver
+
+Silver transforms Bronze snapshots into fixed-width L2 feature rows with top-of-book, spread, cumulative depth volumes, imbalances, microprice, carried market fields, and validation flags.
+
+The builder records Bronze input content fingerprints in `lake/silver/_silver_transform_state.json`. If inputs are unchanged, the builder exits without rewriting artifacts. If a Bronze partition changes, only that changed input file is read, then merged idempotently into the relevant monthly Silver partition.
+
+### Gold
+
+Gold aggregates Silver features into dense M1 datasets. Missing minutes are explicit rows with zero coverage, `quality_flags = ["missing_minute"]`, and numeric features set to `NaN`.
+
+The builder records Silver input content fingerprints by symbol in `lake/gold/_gold_transform_state.json`. Unchanged symbols are skipped. Changed symbols are rebuilt from all Silver files for that symbol, preserving full-timeframe Gold outputs while avoiding cross-symbol rescans.
+
+Gold artifact hashes include source fingerprints, source summary, schema, transform settings, git commit, and a content hash of the output Gold dataframe. Metadata stores a source fingerprint digest and Gold content hash without embedding filesystem paths.
+
+## Test And Quality State
+
+The test suite covers:
+
+- CLI defaults, locks, JSON output, and builder dispatch.
+- HTTP retry/default config behavior.
+- Deribit symbol normalization and adapter payload validation.
+- L2 polling concurrency, partial failure isolation, and runtime budgets.
+- Bronze partition layout and idempotent row persistence.
+- Silver feature math, incremental state, idempotent monthly merge behavior, and artifact toggles.
+- Gold M1 aggregation, missing-minute densification, plot sampling, content-sensitive artifact hashes, incremental symbol rebuilds, and artifact toggles.
+- Explicit Bronze, Silver, and Gold schema contracts.
+
+Current expected verification commands:
+
+```bash
+.venv/bin/python -m ruff check .
+.venv/bin/python -m mypy .
+.venv/bin/python -m pytest
+```
+
+## Operational Notes
+
+- The system is local-file based; transform state is local to the configured lake roots.
+- Process-level CLI locks prevent overlapping scheduled jobs for the same command.
+- Partition-level `.write.lock` files protect local read/merge/write replacement steps.
+- Runtime logs are written under `.logs/` and are ignored by git.
+
+## Known Limitations
+
+- Only Deribit perpetual L2 snapshots are supported.
+- The collector uses REST polling rather than websocket streaming.
+- There is no distributed metadata catalog, database sink, or multi-host locking layer.
+- Incremental state is content-fingerprint based and assumes writers use the same local lake roots.

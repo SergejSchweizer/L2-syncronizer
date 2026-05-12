@@ -13,6 +13,7 @@ from ingestion.lake import save_l2_snapshot_parquet_lake
 from ingestion.silver import (
     silver_l2_features_from_bronze,
     silver_l2_snapshot_partition_path,
+    silver_transform_state_path,
     transform_l2_bronze_to_silver,
 )
 
@@ -109,12 +110,15 @@ def test_transform_l2_bronze_to_silver_skips_manifest_and_plot_when_disabled(tmp
     assert len(files) == 1
     assert files[0].endswith("2026-05.parquet")
     assert Path(files[0]).exists()
-    assert not any(path.name.endswith(".json") for path in Path(silver_root).rglob("*.json"))
+    artifact_json_files = [
+        path for path in Path(silver_root).rglob("*.json") if path.name != "_silver_transform_state.json"
+    ]
+    assert not artifact_json_files
     assert not any(path.name.endswith(".png") for path in Path(silver_root).rglob("*.png"))
 
 
 def test_transform_l2_bronze_to_silver_writes_monthly_idempotent_partitions(tmp_path: Path) -> None:
-    """Verify bronze-to-silver writes one deduplicated monthly feature partition."""
+    """Verify bronze-to-silver skips unchanged inputs and keeps one monthly partition."""
 
     bronze_root = tmp_path / "bronze"
     silver_root = tmp_path / "silver"
@@ -132,7 +136,7 @@ def test_transform_l2_bronze_to_silver_writes_monthly_idempotent_partitions(tmp_
         depth=50,
     )
 
-    assert first_files == second_files
+    assert second_files == []
     assert len(first_files) == 3
     assert any(
         "/dataset_type=l2_snapshot_features/exchange=deribit/instrument_type=perp/" in file_path
@@ -154,3 +158,63 @@ def test_transform_l2_bronze_to_silver_writes_monthly_idempotent_partitions(tmp_
     assert metadata["row_count"] == 1
     assert metadata["symbols"] == ["BTC-PERPETUAL"]
     assert Path(png_file).stat().st_size > 0
+    assert silver_transform_state_path(str(silver_root)).exists()
+    assert (Path(parquet_file).parent / ".write.lock").exists()
+
+
+def test_transform_l2_bronze_to_silver_processes_only_changed_bronze_partitions(tmp_path: Path) -> None:
+    """Verify an updated Bronze partition is merged without rescanning unchanged inputs."""
+
+    bronze_root = tmp_path / "bronze"
+    silver_root = tmp_path / "silver"
+    snapshot_1 = _sample_l2_snapshot(second=1)
+    snapshot_2 = _sample_l2_snapshot(second=11)
+    save_l2_snapshot_parquet_lake({"BTC": [snapshot_1]}, lake_root=str(bronze_root), depth=50)
+
+    first_files = transform_l2_bronze_to_silver(
+        bronze_lake_root=str(bronze_root),
+        silver_lake_root=str(silver_root),
+        depth=50,
+        plot=False,
+        manifest=False,
+    )
+    save_l2_snapshot_parquet_lake({"BTC": [snapshot_1, snapshot_2]}, lake_root=str(bronze_root), depth=50)
+    second_files = transform_l2_bronze_to_silver(
+        bronze_lake_root=str(bronze_root),
+        silver_lake_root=str(silver_root),
+        depth=50,
+        plot=False,
+        manifest=False,
+    )
+
+    assert len(first_files) == 1
+    assert second_files == first_files
+    records = pl.read_parquet(first_files[0])
+    assert records.height == 2
+    assert records["ts_event"].to_list() == [snapshot_1.timestamp, snapshot_2.timestamp]
+
+
+def test_transform_l2_bronze_to_silver_rebuilds_when_depth_changes(tmp_path: Path) -> None:
+    """Verify transform settings are part of Silver incremental invalidation."""
+
+    bronze_root = tmp_path / "bronze"
+    silver_root = tmp_path / "silver"
+    save_l2_snapshot_parquet_lake({"BTC": [_sample_l2_snapshot()]}, lake_root=str(bronze_root), depth=50)
+
+    first_files = transform_l2_bronze_to_silver(
+        bronze_lake_root=str(bronze_root),
+        silver_lake_root=str(silver_root),
+        depth=50,
+        plot=False,
+        manifest=False,
+    )
+    second_files = transform_l2_bronze_to_silver(
+        bronze_lake_root=str(bronze_root),
+        silver_lake_root=str(silver_root),
+        depth=10,
+        plot=False,
+        manifest=False,
+    )
+
+    assert first_files == second_files
+    assert 10 in pl.read_parquet(first_files[0])["bid_prices"].list.len().to_list()

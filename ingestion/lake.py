@@ -8,6 +8,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import cast
 
+from ingestion.file_lock import FileLock
 from ingestion.l2 import (
     L2Snapshot,
     l2_snapshot_partition_key,
@@ -110,16 +111,18 @@ def save_l2_snapshot_parquet_lake(
         part_dir.mkdir(parents=True, exist_ok=True)
         file_path = part_dir / "data.parquet"
         staging_path = part_dir / f".staging-{run_id}.parquet"
+        lock_path = part_dir / ".write.lock"
 
-        existing_rows: list[dict[str, object]] = []
-        if file_path.exists():
-            existing_table = pq.ParquetFile(file_path).read()  # type: ignore[no-untyped-call]
-            existing_rows = existing_table.to_pylist()
+        with FileLock(lock_path):
+            existing_rows: list[dict[str, object]] = []
+            if file_path.exists():
+                existing_table = pq.ParquetFile(file_path).read()  # type: ignore[no-untyped-call]
+                existing_rows = existing_table.to_pylist()
 
-        merged_rows = merge_and_deduplicate_snapshot_rows(existing=existing_rows, new=rows)
-        table = pa.Table.from_pylist(merged_rows)
-        pq.write_table(table, staging_path)  # type: ignore[no-untyped-call]
-        staging_path.replace(file_path)
+            merged_rows = merge_and_deduplicate_snapshot_rows(existing=existing_rows, new=rows)
+            table = pa.Table.from_pylist(merged_rows)
+            pq.write_table(table, staging_path)  # type: ignore[no-untyped-call]
+            staging_path.replace(file_path)
         return str(file_path.resolve())
 
     written_files: list[str] = []
