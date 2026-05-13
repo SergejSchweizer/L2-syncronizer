@@ -283,10 +283,21 @@ def gold_l2_m1_from_silver(
         .select(GOLD_COLUMNS)
         .sort(["symbol", "ts_minute"])
     )
-    dense = densify_gold_m1_timeframe(observed)
+    return prepare_gold_m1_timeframe(gold=observed, fill_missing_minutes=fill_missing_minutes, densify=True)
+
+
+def prepare_gold_m1_timeframe(
+    gold: pl.DataFrame,
+    *,
+    fill_missing_minutes: bool,
+    densify: bool = True,
+) -> pl.DataFrame:
+    """Return Gold rows with optional minute densification and missing-minute fill."""
+
+    prepared = densify_gold_m1_timeframe(gold) if densify else gold
     if fill_missing_minutes:
-        return fill_gold_missing_minutes_with_neighbor_averages(dense)
-    return dense
+        return fill_gold_missing_minutes_with_neighbor_averages(prepared)
+    return prepared
 
 
 def densify_gold_m1_timeframe(gold: pl.DataFrame) -> pl.DataFrame:
@@ -345,15 +356,12 @@ def fill_gold_missing_minutes_with_neighbor_averages(gold: pl.DataFrame) -> pl.D
     filled_frames: list[pl.DataFrame] = []
     for partition in gold.partition_by(GOLD_DATASET_PARTITION_COLUMNS):
         rows = partition.sort("ts_minute").to_dicts()
-        for index, row in enumerate(rows):
-            if "missing_minute" not in _quality_flags(row):
+        for index in range(len(rows)):
+            if not _can_fill_row_from_neighbors(rows, index):
                 continue
-            if index == 0 or index >= len(rows) - 1:
-                continue
+            row = rows[index]
             previous_row = rows[index - 1]
             following_row = rows[index + 1]
-            if "missing_minute" in _quality_flags(previous_row) or "missing_minute" in _quality_flags(following_row):
-                continue
             for feature in GOLD_NUMERIC_FEATURES:
                 row[feature] = _average_gold_feature(previous_row.get(feature), following_row.get(feature))
             row["quality_flags"] = _merged_quality_flags(row, "filled_neighbor_average")
@@ -381,10 +389,12 @@ def write_gold_l2_m1_artifacts(
     if gold.is_empty():
         return []
 
-    if densify:
-        gold = densify_gold_m1_timeframe(gold)
-        if fill_missing_minutes:
-            gold = fill_gold_missing_minutes_with_neighbor_averages(gold)
+    if densify or fill_missing_minutes:
+        gold = prepare_gold_m1_timeframe(
+            gold=gold,
+            fill_missing_minutes=fill_missing_minutes,
+            densify=densify,
+        )
     written_files: list[str] = []
 
     for symbol_frame in gold.partition_by(GOLD_DATASET_PARTITION_COLUMNS):
@@ -859,6 +869,21 @@ def _quality_flags(row: dict[str, Any]) -> list[str]:
 
     flags = row.get("quality_flags", [])
     return [str(flag) for flag in flags] if isinstance(flags, list) else []
+
+
+def _can_fill_row_from_neighbors(rows: list[dict[str, Any]], index: int) -> bool:
+    """Return whether one Gold row can be filled from adjacent observed minutes."""
+
+    if index == 0 or index >= len(rows) - 1:
+        return False
+    row = rows[index]
+    if "missing_minute" not in _quality_flags(row):
+        return False
+    previous_row = rows[index - 1]
+    following_row = rows[index + 1]
+    return "missing_minute" not in _quality_flags(previous_row) and "missing_minute" not in _quality_flags(
+        following_row
+    )
 
 
 def _merged_quality_flags(row: dict[str, Any], flag: str) -> list[str]:

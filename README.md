@@ -414,6 +414,16 @@ Or use:
 make check
 ```
 
+Current coverage highlights:
+
+- CLI command parsing/defaults and builder dispatch behavior.
+- Bronze parquet partition layout and idempotent merge semantics.
+- Silver feature calculations, incremental invalidation, and artifact toggles.
+- Gold M1 aggregation with missing-minute densification and neighbor-average fill policy.
+- Gold edge-case guards where fill is skipped when adjacent observed minutes are unavailable.
+- Gold incremental invalidation when completeness or fill policy settings change.
+- Schema contracts for Bronze, Silver, and Gold outputs.
+
 ## Known Limitations
 
 - Only Deribit perpetual L2 order book snapshots are supported.

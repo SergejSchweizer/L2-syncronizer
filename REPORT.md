@@ -54,7 +54,8 @@ The test suite covers:
 - L2 polling concurrency, partial failure isolation, and runtime budgets.
 - Bronze partition layout and idempotent row persistence.
 - Silver feature math, incremental state, idempotent monthly merge behavior, and artifact toggles.
-- Gold M1 aggregation, missing-minute densification/filling, plot sampling, content-sensitive artifact hashes, incremental symbol rebuilds, and artifact toggles.
+- Gold M1 aggregation, missing-minute densification/filling, fill edge-case guards, content-sensitive artifact hashes, plot sampling, incremental symbol rebuilds, and artifact toggles.
+- Gold incremental invalidation when completeness threshold or fill policy settings change.
 - Explicit Bronze, Silver, and Gold schema contracts.
 
 Current expected verification commands:

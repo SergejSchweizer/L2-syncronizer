@@ -172,6 +172,26 @@ def test_gold_l2_m1_from_silver_can_fill_missing_minutes_from_neighbor_averages(
     assert filled["mark_price_last"] == 101.01
 
 
+def test_gold_l2_m1_from_silver_does_not_fill_when_one_neighbor_is_missing() -> None:
+    """Verify missing-minute fill requires both adjacent minutes to be observed rows."""
+
+    silver = pl.DataFrame(
+        [
+            _silver_row(second=0, minute=0, mid_price=100.0),
+            _silver_row(second=0, minute=3, mid_price=103.0),
+        ]
+    )
+
+    filled = gold_l2_m1_from_silver(silver, fill_missing_minutes=True)
+    minute_one = filled.row(1, named=True)
+    minute_two = filled.row(2, named=True)
+
+    assert minute_one["quality_flags"] == ["missing_minute"]
+    assert minute_two["quality_flags"] == ["missing_minute"]
+    assert math.isnan(minute_one["mid_open"])
+    assert math.isnan(minute_two["mid_open"])
+
+
 def test_write_gold_l2_m1_artifacts_writes_parquet_json_and_png(tmp_path: Path) -> None:
     """Verify Gold artifacts are written under the versioned timeframe dataset leaf."""
 
@@ -504,3 +524,61 @@ def test_transform_l2_silver_to_gold_rebuilds_when_quality_policy_changes(tmp_pa
     assert len(first_files) == 1
     assert len(second_files) == 1
     assert Path(first_files[0]).stem != Path(second_files[0]).stem
+
+
+def test_transform_l2_silver_to_gold_rebuilds_when_fill_policy_changes(tmp_path: Path) -> None:
+    """Verify fill_missing_minutes setting participates in Gold incremental invalidation."""
+
+    silver_root = tmp_path / "silver"
+    gold_root = tmp_path / "gold"
+    _write_silver_partition(
+        silver_root,
+        "BTC-PERPETUAL",
+        [
+            _silver_row(second=0, minute=0, mid_price=100.0, symbol="BTC-PERPETUAL"),
+            _silver_row(second=0, minute=2, mid_price=102.0, symbol="BTC-PERPETUAL"),
+        ],
+    )
+
+    first_files = transform_l2_silver_to_gold(
+        silver_lake_root=str(silver_root),
+        gold_lake_root=str(gold_root),
+        fill_missing_minutes=False,
+        plot=False,
+        manifest=False,
+    )
+    second_files = transform_l2_silver_to_gold(
+        silver_lake_root=str(silver_root),
+        gold_lake_root=str(gold_root),
+        fill_missing_minutes=True,
+        plot=False,
+        manifest=False,
+    )
+
+    assert len(first_files) == 1
+    assert len(second_files) == 1
+    assert Path(first_files[0]).stem != Path(second_files[0]).stem
+
+
+def test_gold_metadata_records_fill_policy_flag() -> None:
+    """Verify Gold metadata includes the fill policy used for artifact generation."""
+
+    silver = pl.DataFrame(
+        [
+            _silver_row(second=0, minute=0, mid_price=100.0),
+            _silver_row(second=0, minute=2, mid_price=102.0),
+        ]
+    )
+    gold = gold_l2_m1_from_silver(silver, fill_missing_minutes=True)
+    metadata = gold_metadata(
+        gold=gold,
+        source_summary=silver_source_summary(silver),
+        hash_string="hash123",
+        git_commit_hash="abcdef1234567890",
+        expected_snapshots_per_minute=6,
+        completeness_threshold=0.8,
+        feature_set_version="gold_l2_m1_v1",
+        fill_missing_minutes=True,
+    )
+
+    assert metadata["fill_missing_minutes"] is True
