@@ -176,6 +176,7 @@ def test_gold_builder_parser_defaults_can_come_from_config() -> None:
     assert args.gold_lake_root == "custom/gold"
     assert args.expected_snapshots_per_minute == 6
     assert args.completeness_threshold == 0.8
+    assert args.fill_policy == "neighbor"
     assert args.json_output is False
 
 
@@ -489,6 +490,7 @@ def test_main_gold_builder_outputs_artifact_files(
             "plot": True,
             "manifest": True,
             "fill_missing_minutes": False,
+            "fill_policy": "neighbor",
         }
     ]
 
@@ -536,5 +538,51 @@ def test_main_gold_builder_respects_plot_and_manifest_flags(
             "plot": False,
             "manifest": False,
             "fill_missing_minutes": True,
+            "fill_policy": "neighbor",
+        }
+    ]
+
+
+def test_main_gold_builder_passes_hybrid_fill_policy(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Verify gold-builder forwards the hybrid fill policy to the transform."""
+
+    calls: list[dict[str, object]] = []
+
+    def fake_transform_l2_silver_to_gold(**kwargs: object) -> list[str]:
+        calls.append(kwargs)
+        return ["/tmp/lake/gold/BTC_hash_commit.parquet"]
+
+    monkeypatch.setattr(cli, "transform_l2_silver_to_gold", fake_transform_l2_silver_to_gold)
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "main.py",
+            GOLD_BUILDER_COMMAND,
+            "--silver-lake-root",
+            "custom/silver",
+            "--gold-lake-root",
+            "custom/gold",
+            "--fill-missing-minutes",
+            "--fill-policy",
+            "hybrid",
+        ],
+    )
+
+    cli.main()
+    _ = capsys.readouterr().out
+
+    assert calls == [
+        {
+            "silver_lake_root": "custom/silver",
+            "gold_lake_root": "custom/gold",
+            "expected_snapshots_per_minute": 6,
+            "completeness_threshold": 0.8,
+            "plot": True,
+            "manifest": True,
+            "fill_missing_minutes": True,
+            "fill_policy": "hybrid",
         }
     ]

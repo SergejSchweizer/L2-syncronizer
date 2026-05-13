@@ -191,6 +191,12 @@ def build_parser(config: Config | None = None) -> argparse.ArgumentParser:
         False,
         "Fill missing Gold numeric features with adjacent-minute averages",
     )
+    gold_parser.add_argument(
+        "--fill-policy",
+        choices=["neighbor", "hybrid"],
+        default="neighbor",
+        help="Gap-filling policy used when --fill-missing-minutes is enabled",
+    )
     _boolean_optional_flag(
         gold_parser,
         "plot",
@@ -508,6 +514,7 @@ def _run_gold_builder(args: argparse.Namespace, logger: logging.Logger) -> None:
         plot=bool(args.plot),
         manifest=bool(args.manifest),
         fill_missing_minutes=bool(args.fill_missing_minutes),
+        fill_policy=cast(str, args.fill_policy),
     )
     elapsed_s = perf_counter() - started_at
     output = {
@@ -518,6 +525,7 @@ def _run_gold_builder(args: argparse.Namespace, logger: logging.Logger) -> None:
         "expected_snapshots_per_minute": expected_snapshots_per_minute,
         "completeness_threshold": completeness_threshold,
         "fill_missing_minutes": bool(args.fill_missing_minutes),
+        "fill_policy": cast(str, args.fill_policy),
         "artifact_files": written_files,
     }
     if bool(args.json_output):
@@ -525,13 +533,14 @@ def _run_gold_builder(args: argparse.Namespace, logger: logging.Logger) -> None:
     logger.info(
         "gold-builder run summary status=complete elapsed_s=%.3f silver_lake_root=%s "
         "gold_lake_root=%s expected_snapshots_per_minute=%s completeness_threshold=%.3f "
-        "fill_missing_minutes=%s artifact_files=%s",
+        "fill_missing_minutes=%s fill_policy=%s artifact_files=%s",
         elapsed_s,
         silver_lake_root,
         gold_lake_root,
         expected_snapshots_per_minute,
         completeness_threshold,
         bool(args.fill_missing_minutes),
+        cast(str, args.fill_policy),
         len(written_files),
     )
 

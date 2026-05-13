@@ -73,6 +73,11 @@ GOLD_NUMERIC_FEATURES = [
 ]
 GOLD_COLUMNS = [*GOLD_KEY_COLUMNS, *GOLD_METADATA_COLUMNS, *GOLD_NUMERIC_FEATURES]
 GOLD_STATE_FILE_NAME = "_gold_transform_state.json"
+GOLD_FILL_POLICY_NEIGHBOR = "neighbor"
+GOLD_FILL_POLICY_HYBRID = "hybrid"
+GOLD_FILL_POLICIES = (GOLD_FILL_POLICY_NEIGHBOR, GOLD_FILL_POLICY_HYBRID)
+GOLD_HYBRID_INTERPOLATION_MAX_GAP_MINUTES = 5
+GOLD_HYBRID_BOUNDARY_FILL_MAX_GAP_MINUTES = 2
 
 
 @dataclass(frozen=True)
@@ -101,6 +106,7 @@ def transform_l2_silver_to_gold(
     plot: bool = True,
     manifest: bool = True,
     fill_missing_minutes: bool = False,
+    fill_policy: str = GOLD_FILL_POLICY_NEIGHBOR,
 ) -> list[str]:
     """Transform silver L2 snapshot features into per-symbol gold M1 artifacts."""
 
@@ -108,6 +114,8 @@ def transform_l2_silver_to_gold(
         raise ValueError("expected_snapshots_per_minute must be positive")
     if not 0 < completeness_threshold <= 1:
         raise ValueError("completeness_threshold must be in (0, 1]")
+    if fill_policy not in GOLD_FILL_POLICIES:
+        raise ValueError(f"fill_policy must be one of {GOLD_FILL_POLICIES}")
 
     silver_files = silver_parquet_files(silver_lake_root)
     if not silver_files:
@@ -125,6 +133,7 @@ def transform_l2_silver_to_gold(
         and state.get("feature_set_version") == feature_set_version
         and state.get("git_commit_hash") == git_commit_hash
         and state.get("fill_missing_minutes") == fill_missing_minutes
+        and state.get("fill_policy") == fill_policy
     )
     changed_symbols = [
         symbol
@@ -149,6 +158,7 @@ def transform_l2_silver_to_gold(
             completeness_threshold=completeness_threshold,
             feature_set_version=feature_set_version,
             fill_missing_minutes=fill_missing_minutes,
+            fill_policy=fill_policy,
         )
         symbol_written_files = write_gold_l2_m1_artifacts(
             gold=gold,
@@ -163,6 +173,7 @@ def transform_l2_silver_to_gold(
             densify=False,
             source_fingerprints=symbol_fingerprints,
             fill_missing_minutes=fill_missing_minutes,
+            fill_policy=fill_policy,
         )
         written_files.extend(symbol_written_files)
         next_symbol_state[symbol] = {
@@ -181,6 +192,7 @@ def transform_l2_silver_to_gold(
             "feature_set_version": feature_set_version,
             "git_commit_hash": git_commit_hash,
             "fill_missing_minutes": fill_missing_minutes,
+            "fill_policy": fill_policy,
             "changed_symbols": changed_symbols,
             "symbols": next_symbol_state,
         },
@@ -227,6 +239,7 @@ def gold_l2_m1_from_silver(
     completeness_threshold: float = COMPLETE_MINUTE_COVERAGE_THRESHOLD,
     feature_set_version: str = GOLD_FEATURE_SET_VERSION,
     fill_missing_minutes: bool = False,
+    fill_policy: str = GOLD_FILL_POLICY_NEIGHBOR,
 ) -> pl.DataFrame:
     """Aggregate silver L2 snapshot features to one M1 gold row per symbol."""
 
@@ -283,21 +296,184 @@ def gold_l2_m1_from_silver(
         .select(GOLD_COLUMNS)
         .sort(["symbol", "ts_minute"])
     )
-    return prepare_gold_m1_timeframe(gold=observed, fill_missing_minutes=fill_missing_minutes, densify=True)
+    return prepare_gold_m1_timeframe(
+        gold=observed,
+        fill_missing_minutes=fill_missing_minutes,
+        fill_policy=fill_policy,
+        densify=True,
+    )
 
 
 def prepare_gold_m1_timeframe(
     gold: pl.DataFrame,
     *,
     fill_missing_minutes: bool,
+    fill_policy: str = GOLD_FILL_POLICY_NEIGHBOR,
     densify: bool = True,
 ) -> pl.DataFrame:
     """Return Gold rows with optional minute densification and missing-minute fill."""
 
     prepared = densify_gold_m1_timeframe(gold) if densify else gold
     if fill_missing_minutes:
-        return fill_gold_missing_minutes_with_neighbor_averages(prepared)
+        if fill_policy == GOLD_FILL_POLICY_NEIGHBOR:
+            return fill_gold_missing_minutes_with_neighbor_averages(prepared)
+        if fill_policy == GOLD_FILL_POLICY_HYBRID:
+            return fill_gold_missing_minutes_hybrid(prepared)
+        raise ValueError(f"Unsupported fill_policy: {fill_policy}")
     return prepared
+
+
+def fill_gold_missing_minutes_hybrid(gold: pl.DataFrame) -> pl.DataFrame:
+    """Fill Gold missing minutes with hybrid interpolation and bounded boundary carry."""
+
+    if gold.is_empty():
+        return gold
+
+    filled_frames: list[pl.DataFrame] = []
+    for partition in gold.partition_by(GOLD_DATASET_PARTITION_COLUMNS):
+        rows = partition.sort("ts_minute").to_dicts()
+        for start, end in _missing_runs(rows):
+            run_length = end - start + 1
+            left_index = start - 1
+            right_index = end + 1
+            left_observed = left_index >= 0 and not _is_missing_minute_row(rows[left_index])
+            right_observed = right_index < len(rows) and not _is_missing_minute_row(rows[right_index])
+
+            if left_observed and right_observed:
+                if run_length == 1:
+                    _fill_row_from_neighbor_average(rows[start], rows[left_index], rows[right_index])
+                elif run_length <= GOLD_HYBRID_INTERPOLATION_MAX_GAP_MINUTES:
+                    _fill_run_with_linear_interpolation(
+                        rows=rows,
+                        start=start,
+                        end=end,
+                        left_row=rows[left_index],
+                        right_row=rows[right_index],
+                    )
+                else:
+                    _mark_rows_with_flag(rows=rows, start=start, end=end, flag="missing_long_gap")
+                continue
+
+            if left_observed and not right_observed and run_length <= GOLD_HYBRID_BOUNDARY_FILL_MAX_GAP_MINUTES:
+                _fill_run_from_single_neighbor(
+                    rows=rows,
+                    start=start,
+                    end=end,
+                    source_row=rows[left_index],
+                    flag="filled_forward_boundary",
+                )
+                continue
+
+            if right_observed and not left_observed and run_length <= GOLD_HYBRID_BOUNDARY_FILL_MAX_GAP_MINUTES:
+                _fill_run_from_single_neighbor(
+                    rows=rows,
+                    start=start,
+                    end=end,
+                    source_row=rows[right_index],
+                    flag="filled_backward_boundary",
+                )
+                continue
+
+            _mark_rows_with_flag(rows=rows, start=start, end=end, flag="missing_long_gap")
+
+        filled_frames.append(pl.DataFrame(rows, schema=partition.schema))
+
+    return pl.concat(filled_frames, how="vertical").select(GOLD_COLUMNS).sort(["symbol", "ts_minute"])
+
+
+def _fill_run_with_linear_interpolation(
+    rows: list[dict[str, Any]],
+    start: int,
+    end: int,
+    left_row: dict[str, Any],
+    right_row: dict[str, Any],
+) -> None:
+    """Linearly interpolate one internal missing run from observed endpoints."""
+
+    run_length = end - start + 1
+    for offset, index in enumerate(range(start, end + 1), start=1):
+        row = rows[index]
+        ratio = offset / (run_length + 1)
+        for feature in GOLD_NUMERIC_FEATURES:
+            row[feature] = _interpolate_gold_feature(left_row.get(feature), right_row.get(feature), ratio)
+        row["quality_flags"] = _merged_quality_flags(row, "filled_linear_interpolation")
+
+
+def _fill_run_from_single_neighbor(
+    rows: list[dict[str, Any]],
+    start: int,
+    end: int,
+    source_row: dict[str, Any],
+    flag: str,
+) -> None:
+    """Fill one boundary missing run from a single neighboring observed row."""
+
+    for index in range(start, end + 1):
+        row = rows[index]
+        for feature in GOLD_NUMERIC_FEATURES:
+            row[feature] = _coerced_gold_numeric(source_row.get(feature))
+        row["quality_flags"] = _merged_quality_flags(row, flag)
+
+
+def _mark_rows_with_flag(rows: list[dict[str, Any]], start: int, end: int, flag: str) -> None:
+    """Append one quality flag across a contiguous row interval."""
+
+    for index in range(start, end + 1):
+        rows[index]["quality_flags"] = _merged_quality_flags(rows[index], flag)
+
+
+def _missing_runs(rows: list[dict[str, Any]]) -> list[tuple[int, int]]:
+    """Return start/end indices for contiguous missing-minute runs."""
+
+    runs: list[tuple[int, int]] = []
+    start: int | None = None
+    for index, row in enumerate(rows):
+        if _is_missing_minute_row(row):
+            start = index if start is None else start
+            continue
+        if start is not None:
+            runs.append((start, index - 1))
+            start = None
+    if start is not None:
+        runs.append((start, len(rows) - 1))
+    return runs
+
+
+def _fill_row_from_neighbor_average(
+    row: dict[str, Any],
+    previous_row: dict[str, Any],
+    following_row: dict[str, Any],
+) -> None:
+    """Fill one missing row from the average of adjacent observed rows."""
+
+    for feature in GOLD_NUMERIC_FEATURES:
+        row[feature] = _average_gold_feature(previous_row.get(feature), following_row.get(feature))
+    row["quality_flags"] = _merged_quality_flags(row, "filled_neighbor_average")
+
+
+def _is_missing_minute_row(row: dict[str, Any]) -> bool:
+    """Return whether one Gold row is a synthetic missing-minute placeholder."""
+
+    return "missing_minute" in _quality_flags(row)
+
+
+def _interpolate_gold_feature(left_value: object, right_value: object, ratio: float) -> float:
+    """Linearly interpolate a Gold numeric feature between two observed endpoints."""
+
+    left = _coerced_gold_numeric(left_value)
+    right = _coerced_gold_numeric(right_value)
+    if not math.isfinite(left) or not math.isfinite(right):
+        return float("nan")
+    return left + (right - left) * ratio
+
+
+def _coerced_gold_numeric(value: object) -> float:
+    """Coerce one numeric-like value to float, preserving NaN for non-finite inputs."""
+
+    if not isinstance(value, int | float):
+        return float("nan")
+    parsed = float(value)
+    return parsed if math.isfinite(parsed) else float("nan")
 
 
 def densify_gold_m1_timeframe(gold: pl.DataFrame) -> pl.DataFrame:
@@ -383,6 +559,7 @@ def write_gold_l2_m1_artifacts(
     densify: bool = True,
     source_fingerprints: dict[str, Any] | None = None,
     fill_missing_minutes: bool = False,
+    fill_policy: str = GOLD_FILL_POLICY_NEIGHBOR,
 ) -> list[str]:
     """Write full versioned Gold datasets under lake-style timeframe leaves."""
 
@@ -393,6 +570,7 @@ def write_gold_l2_m1_artifacts(
         gold = prepare_gold_m1_timeframe(
             gold=gold,
             fill_missing_minutes=fill_missing_minutes,
+            fill_policy=fill_policy,
             densify=densify,
         )
     written_files: list[str] = []
@@ -416,6 +594,7 @@ def write_gold_l2_m1_artifacts(
             "source_fingerprints": source_fingerprints or {},
             "gold_content_hash": gold_content_hash,
             "fill_missing_minutes": fill_missing_minutes,
+            "fill_policy": fill_policy,
             "gold_schema": {name: str(dtype) for name, dtype in symbol_frame.schema.items()},
         }
         hash_string = stable_json_hash(hash_payload)
@@ -451,6 +630,7 @@ def write_gold_l2_m1_artifacts(
                 source_fingerprints=source_fingerprints or {},
                 gold_content_hash=gold_content_hash,
                 fill_missing_minutes=fill_missing_minutes,
+                fill_policy=fill_policy,
             )
 
         if manifest:
@@ -537,6 +717,7 @@ def gold_metadata(
     source_fingerprints: dict[str, Any] | None = None,
     gold_content_hash: str | None = None,
     fill_missing_minutes: bool = False,
+    fill_policy: str = GOLD_FILL_POLICY_NEIGHBOR,
 ) -> dict[str, Any]:
     """Build JSON metadata for one gold artifact without filesystem paths."""
 
@@ -552,6 +733,7 @@ def gold_metadata(
         "expected_snapshots_per_minute": expected_snapshots_per_minute,
         "completeness_threshold": completeness_threshold,
         "fill_missing_minutes": fill_missing_minutes,
+        "fill_policy": fill_policy,
         "row_count": gold.height,
         "column_count": len(gold.columns),
         "timestamp_min": timestamp_min,

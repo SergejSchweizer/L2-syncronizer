@@ -8,10 +8,13 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 import polars as pl
+import pytest
 
 from ingestion.gold import (
+    GOLD_NUMERIC_FEATURES,
     base_asset_symbol,
     dataframe_content_hash,
+    fill_gold_missing_minutes_hybrid,
     gold_l2_m1_dataset_path,
     gold_l2_m1_from_silver,
     gold_metadata,
@@ -192,6 +195,100 @@ def test_gold_l2_m1_from_silver_does_not_fill_when_one_neighbor_is_missing() -> 
     assert math.isnan(minute_two["mid_open"])
 
 
+def test_gold_l2_m1_from_silver_hybrid_interpolates_short_internal_gaps() -> None:
+    """Verify hybrid fill linearly interpolates short internal missing runs."""
+
+    silver = pl.DataFrame(
+        [
+            _silver_row(second=0, minute=0, mid_price=100.0),
+            _silver_row(second=0, minute=3, mid_price=103.0),
+        ]
+    )
+    filled = gold_l2_m1_from_silver(silver, fill_missing_minutes=True, fill_policy="hybrid")
+    minute_one = filled.row(1, named=True)
+    minute_two = filled.row(2, named=True)
+
+    assert minute_one["quality_flags"] == ["missing_minute", "filled_linear_interpolation"]
+    assert minute_two["quality_flags"] == ["missing_minute", "filled_linear_interpolation"]
+    assert minute_one["mid_open"] == 101.0
+    assert minute_two["mid_open"] == 102.0
+
+
+def test_gold_l2_m1_from_silver_hybrid_boundary_fill_and_long_gap_marking() -> None:
+    """Verify hybrid fill handles boundary runs and preserves long-gap missing rows."""
+
+    observed = gold_l2_m1_from_silver(_sample_silver_frame())
+    missing_template = observed.row(0, named=True)
+    missing_template.update(
+        {
+            "snapshot_count": 0,
+            "coverage_ratio": 0.0,
+            "first_snapshot_ts": None,
+            "last_snapshot_ts": None,
+            "is_complete_minute": False,
+            "quality_flags": ["missing_minute"],
+        }
+    )
+    for feature in GOLD_NUMERIC_FEATURES:
+        missing_template[feature] = float("nan")
+
+    boundary_lead = dict(missing_template)
+    boundary_lead["ts_minute"] = datetime(2026, 5, 6, 9, 59, tzinfo=UTC)
+    boundary_tail = dict(missing_template)
+    boundary_tail["ts_minute"] = datetime(2026, 5, 6, 10, 1, tzinfo=UTC)
+    hybrid_input = pl.DataFrame([boundary_lead, observed.row(0, named=True), boundary_tail], schema=observed.schema)
+    hybrid_filled = fill_gold_missing_minutes_hybrid(hybrid_input)
+    lead_row = hybrid_filled.row(0, named=True)
+    tail_row = hybrid_filled.row(2, named=True)
+    assert "filled_backward_boundary" in lead_row["quality_flags"]
+    assert "filled_forward_boundary" in tail_row["quality_flags"]
+    assert lead_row["mid_open"] == observed.row(0, named=True)["mid_open"]
+    assert tail_row["mid_open"] == observed.row(0, named=True)["mid_open"]
+
+    long_gap_silver = pl.DataFrame(
+        [
+            _silver_row(second=0, minute=0, mid_price=100.0),
+            _silver_row(second=0, minute=8, mid_price=108.0),
+        ]
+    )
+    long_gap_filled = gold_l2_m1_from_silver(long_gap_silver, fill_missing_minutes=True, fill_policy="hybrid")
+    long_gap_row = long_gap_filled.row(4, named=True)
+    assert "missing_long_gap" in long_gap_row["quality_flags"]
+    assert math.isnan(long_gap_row["mid_open"])
+
+
+def test_gold_l2_m1_from_silver_hybrid_respects_boundary_fill_max_gap() -> None:
+    """Verify hybrid mode does not boundary-fill runs larger than the configured edge limit."""
+
+    observed = gold_l2_m1_from_silver(_sample_silver_frame())
+    missing_template = observed.row(0, named=True)
+    missing_template.update(
+        {
+            "snapshot_count": 0,
+            "coverage_ratio": 0.0,
+            "first_snapshot_ts": None,
+            "last_snapshot_ts": None,
+            "is_complete_minute": False,
+            "quality_flags": ["missing_minute"],
+        }
+    )
+    for feature in GOLD_NUMERIC_FEATURES:
+        missing_template[feature] = float("nan")
+
+    missing_lead_three = []
+    for minute in (9, 8, 7):
+        row = dict(missing_template)
+        row["ts_minute"] = datetime(2026, 5, 6, minute, 59, tzinfo=UTC)
+        missing_lead_three.append(row)
+
+    hybrid_input = pl.DataFrame([*missing_lead_three, observed.row(0, named=True)], schema=observed.schema)
+    hybrid_filled = fill_gold_missing_minutes_hybrid(hybrid_input).sort("ts_minute")
+    for idx in range(3):
+        row = hybrid_filled.row(idx, named=True)
+        assert "missing_long_gap" in row["quality_flags"]
+        assert math.isnan(row["mid_open"])
+
+
 def test_write_gold_l2_m1_artifacts_writes_parquet_json_and_png(tmp_path: Path) -> None:
     """Verify Gold artifacts are written under the versioned timeframe dataset leaf."""
 
@@ -294,6 +391,43 @@ def test_write_gold_l2_m1_artifacts_hash_changes_when_output_data_changes(tmp_pa
     )
 
     assert Path(first_files[0]).stem != Path(second_files[0]).stem
+
+
+def test_write_gold_l2_m1_artifacts_hash_changes_when_fill_policy_changes(tmp_path: Path) -> None:
+    """Verify Gold artifact basenames change when fill policy changes."""
+
+    silver = pl.DataFrame(
+        [
+            _silver_row(second=0, minute=0, mid_price=100.0),
+            _silver_row(second=0, minute=3, mid_price=103.0),
+        ]
+    )
+    gold = gold_l2_m1_from_silver(silver, fill_missing_minutes=True, fill_policy="hybrid")
+
+    neighbor_files = write_gold_l2_m1_artifacts(
+        gold=gold,
+        gold_lake_root=str(tmp_path),
+        source_summary=silver_source_summary(silver),
+        git_commit_hash="abcdef1234567890",
+        plot=False,
+        manifest=False,
+        densify=False,
+        fill_missing_minutes=True,
+        fill_policy="neighbor",
+    )
+    hybrid_files = write_gold_l2_m1_artifacts(
+        gold=gold,
+        gold_lake_root=str(tmp_path),
+        source_summary=silver_source_summary(silver),
+        git_commit_hash="abcdef1234567890",
+        plot=False,
+        manifest=False,
+        densify=False,
+        fill_missing_minutes=True,
+        fill_policy="hybrid",
+    )
+
+    assert Path(neighbor_files[0]).stem != Path(hybrid_files[0]).stem
 
 
 def test_gold_plot_metadata_lines_include_manifest_context() -> None:
@@ -544,6 +678,7 @@ def test_transform_l2_silver_to_gold_rebuilds_when_fill_policy_changes(tmp_path:
         silver_lake_root=str(silver_root),
         gold_lake_root=str(gold_root),
         fill_missing_minutes=False,
+        fill_policy="neighbor",
         plot=False,
         manifest=False,
     )
@@ -551,6 +686,7 @@ def test_transform_l2_silver_to_gold_rebuilds_when_fill_policy_changes(tmp_path:
         silver_lake_root=str(silver_root),
         gold_lake_root=str(gold_root),
         fill_missing_minutes=True,
+        fill_policy="neighbor",
         plot=False,
         manifest=False,
     )
@@ -558,6 +694,40 @@ def test_transform_l2_silver_to_gold_rebuilds_when_fill_policy_changes(tmp_path:
     assert len(first_files) == 1
     assert len(second_files) == 1
     assert Path(first_files[0]).stem != Path(second_files[0]).stem
+
+    third_files = transform_l2_silver_to_gold(
+        silver_lake_root=str(silver_root),
+        gold_lake_root=str(gold_root),
+        fill_missing_minutes=True,
+        fill_policy="hybrid",
+        plot=False,
+        manifest=False,
+    )
+
+    assert len(third_files) == 1
+    assert Path(second_files[0]).stem != Path(third_files[0]).stem
+
+
+def test_transform_l2_silver_to_gold_rejects_unknown_fill_policy(tmp_path: Path) -> None:
+    """Verify unknown fill policies fail fast before transform execution."""
+
+    silver_root = tmp_path / "silver"
+    gold_root = tmp_path / "gold"
+    _write_silver_partition(
+        silver_root,
+        "BTC-PERPETUAL",
+        [_silver_row(second=0, mid_price=100.0, symbol="BTC-PERPETUAL")],
+    )
+
+    with pytest.raises(ValueError, match="fill_policy must be one of"):
+        transform_l2_silver_to_gold(
+            silver_lake_root=str(silver_root),
+            gold_lake_root=str(gold_root),
+            fill_missing_minutes=True,
+            fill_policy="bogus",
+            plot=False,
+            manifest=False,
+        )
 
 
 def test_gold_metadata_records_fill_policy_flag() -> None:
@@ -579,6 +749,8 @@ def test_gold_metadata_records_fill_policy_flag() -> None:
         completeness_threshold=0.8,
         feature_set_version="gold_l2_m1_v1",
         fill_missing_minutes=True,
+        fill_policy="hybrid",
     )
 
     assert metadata["fill_missing_minutes"] is True
+    assert metadata["fill_policy"] == "hybrid"
