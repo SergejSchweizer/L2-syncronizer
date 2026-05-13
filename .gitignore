@@ -21,6 +21,9 @@
 !ingestion/**
 !tests/
 !tests/**
+!docs/
+!docs/assets/
+!docs/assets/gold_profile_btc_1m_example.png
 
 # Explicitly ignore local-only runtime/build/cache artifacts.
 .venv/

@@ -267,6 +267,8 @@ The PNG profile uses the same basename. It plots all numeric Gold features as fe
 
 The BTC-PERPETUAL `1m` profile example (Deribit perp, depth `50`) is the expected shape for a fully generated Gold PNG:
 
+![Gold 1m BTC profile example](docs/assets/gold_profile_btc_1m_example.png)
+
 - Header block:
   - dataset identity (`exchange`, `symbol`, `instrument_type`, `depth`)
   - reproducibility fields (`hash`, git commit prefix, timeframe window)
