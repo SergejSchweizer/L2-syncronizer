@@ -75,9 +75,20 @@ GOLD_COLUMNS = [*GOLD_KEY_COLUMNS, *GOLD_METADATA_COLUMNS, *GOLD_NUMERIC_FEATURE
 GOLD_STATE_FILE_NAME = "_gold_transform_state.json"
 GOLD_FILL_POLICY_NEIGHBOR = "neighbor"
 GOLD_FILL_POLICY_HYBRID = "hybrid"
-GOLD_FILL_POLICIES = (GOLD_FILL_POLICY_NEIGHBOR, GOLD_FILL_POLICY_HYBRID)
+GOLD_FILL_POLICY_KALMAN = "kalman"
+GOLD_FILL_POLICIES = (GOLD_FILL_POLICY_NEIGHBOR, GOLD_FILL_POLICY_HYBRID, GOLD_FILL_POLICY_KALMAN)
 GOLD_HYBRID_INTERPOLATION_MAX_GAP_MINUTES = 5
 GOLD_HYBRID_BOUNDARY_FILL_MAX_GAP_MINUTES = 2
+GOLD_KALMAN_LONG_GAP_MINUTES = 4
+GOLD_FILLED_QUALITY_FLAGS = frozenset(
+    {
+        "filled_neighbor_average",
+        "filled_linear_interpolation",
+        "filled_forward_boundary",
+        "filled_backward_boundary",
+        "filled_kalman_long_gap",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -97,6 +108,54 @@ class GoldDatasetIdentity:
         return base_asset_symbol(self.symbol)
 
 
+class GoldGapFillStrategy:
+    """Interface for Gold missing-minute fill strategies."""
+
+    policy_name = ""
+
+    def apply(self, gold: pl.DataFrame) -> pl.DataFrame:
+        """Return transformed Gold rows with one fill strategy."""
+
+        raise NotImplementedError
+
+
+@dataclass(frozen=True)
+class NeighborAverageFillStrategy(GoldGapFillStrategy):
+    """Fill only one-minute holes using adjacent observed-minute averages."""
+
+    policy_name: str = GOLD_FILL_POLICY_NEIGHBOR
+
+    def apply(self, gold: pl.DataFrame) -> pl.DataFrame:
+        return fill_gold_missing_minutes_with_neighbor_averages(gold)
+
+
+@dataclass(frozen=True)
+class HybridFillStrategy(GoldGapFillStrategy):
+    """Fill short internal/boundary runs while preserving long-gap missing rows."""
+
+    policy_name: str = GOLD_FILL_POLICY_HYBRID
+
+    def apply(self, gold: pl.DataFrame) -> pl.DataFrame:
+        return fill_gold_missing_minutes_hybrid(gold)
+
+
+@dataclass(frozen=True)
+class KalmanFillStrategy(GoldGapFillStrategy):
+    """Fill long internal runs with Kalman smoothing after hybrid preprocessing."""
+
+    policy_name: str = GOLD_FILL_POLICY_KALMAN
+
+    def apply(self, gold: pl.DataFrame) -> pl.DataFrame:
+        return fill_gold_missing_minutes_kalman(gold)
+
+
+_GOLD_FILL_STRATEGIES: dict[str, GoldGapFillStrategy] = {
+    GOLD_FILL_POLICY_NEIGHBOR: NeighborAverageFillStrategy(),
+    GOLD_FILL_POLICY_HYBRID: HybridFillStrategy(),
+    GOLD_FILL_POLICY_KALMAN: KalmanFillStrategy(),
+}
+
+
 def transform_l2_silver_to_gold(
     silver_lake_root: str,
     gold_lake_root: str,
@@ -114,8 +173,7 @@ def transform_l2_silver_to_gold(
         raise ValueError("expected_snapshots_per_minute must be positive")
     if not 0 < completeness_threshold <= 1:
         raise ValueError("completeness_threshold must be in (0, 1]")
-    if fill_policy not in GOLD_FILL_POLICIES:
-        raise ValueError(f"fill_policy must be one of {GOLD_FILL_POLICIES}")
+    _validate_fill_policy(fill_policy)
 
     silver_files = silver_parquet_files(silver_lake_root)
     if not silver_files:
@@ -315,12 +373,51 @@ def prepare_gold_m1_timeframe(
 
     prepared = densify_gold_m1_timeframe(gold) if densify else gold
     if fill_missing_minutes:
-        if fill_policy == GOLD_FILL_POLICY_NEIGHBOR:
-            return fill_gold_missing_minutes_with_neighbor_averages(prepared)
-        if fill_policy == GOLD_FILL_POLICY_HYBRID:
-            return fill_gold_missing_minutes_hybrid(prepared)
-        raise ValueError(f"Unsupported fill_policy: {fill_policy}")
+        strategy = _gold_fill_strategy(fill_policy)
+        return strategy.apply(prepared)
     return prepared
+
+
+def fill_gold_missing_minutes_kalman(gold: pl.DataFrame) -> pl.DataFrame:
+    """Fill Gold missing minutes using hybrid rules plus Kalman smoothing for long gaps."""
+
+    if gold.is_empty():
+        return gold
+
+    hybrid = fill_gold_missing_minutes_hybrid(gold)
+    filled_frames: list[pl.DataFrame] = []
+    for partition in hybrid.partition_by(GOLD_DATASET_PARTITION_COLUMNS):
+        rows = partition.sort("ts_minute").to_dicts()
+        long_runs = [
+            (start, end)
+            for start, end in _missing_runs(rows)
+            if end - start + 1 >= GOLD_KALMAN_LONG_GAP_MINUTES
+        ]
+        if not long_runs:
+            filled_frames.append(partition.sort("ts_minute"))
+            continue
+
+        smoothed_by_feature = {
+            feature: _kalman_smooth_feature_series([row.get(feature) for row in rows])
+            for feature in GOLD_NUMERIC_FEATURES
+        }
+        for start, end in long_runs:
+            any_filled = False
+            for index in range(start, end + 1):
+                row = rows[index]
+                for feature in GOLD_NUMERIC_FEATURES:
+                    smoothed_value = smoothed_by_feature[feature][index]
+                    if not math.isfinite(smoothed_value):
+                        continue
+                    row[feature] = smoothed_value
+                    any_filled = True
+                if any_filled:
+                    row["quality_flags"] = _without_quality_flag(row=row, flag="missing_long_gap")
+                    row["quality_flags"] = _merged_quality_flags(row, "filled_kalman_long_gap")
+
+        filled_frames.append(pl.DataFrame(rows, schema=partition.schema))
+
+    return pl.concat(filled_frames, how="vertical").select(GOLD_COLUMNS).sort(["symbol", "ts_minute"])
 
 
 def fill_gold_missing_minutes_hybrid(gold: pl.DataFrame) -> pl.DataFrame:
@@ -422,6 +519,12 @@ def _mark_rows_with_flag(rows: list[dict[str, Any]], start: int, end: int, flag:
         rows[index]["quality_flags"] = _merged_quality_flags(rows[index], flag)
 
 
+def _without_quality_flag(row: dict[str, Any], flag: str) -> list[str]:
+    """Return row quality flags without one given flag."""
+
+    return [value for value in _quality_flags(row) if value != flag]
+
+
 def _missing_runs(rows: list[dict[str, Any]]) -> list[tuple[int, int]]:
     """Return start/end indices for contiguous missing-minute runs."""
 
@@ -474,6 +577,63 @@ def _coerced_gold_numeric(value: object) -> float:
         return float("nan")
     parsed = float(value)
     return parsed if math.isfinite(parsed) else float("nan")
+
+
+def _kalman_smooth_feature_series(values: list[object]) -> list[float]:
+    """Return one-dimensional Kalman-smoothed values for a numeric feature series."""
+
+    observations = [_coerced_gold_numeric(value) for value in values]
+    observed_values = [value for value in observations if math.isfinite(value)]
+    if len(observed_values) < 2:
+        return observations
+
+    diffs = [abs(observed_values[index] - observed_values[index - 1]) for index in range(1, len(observed_values))]
+    diff_mean = sum(diffs) / len(diffs) if diffs else 0.0
+    process_var = max(1e-10, (diff_mean**2) * 0.05)
+    measurement_var = max(1e-10, (diff_mean**2) * 0.5)
+
+    state = observed_values[0]
+    covariance = 1.0
+    forward_state: list[float] = []
+    forward_covariance: list[float] = []
+    predicted_state: list[float] = []
+    predicted_covariance: list[float] = []
+    for observation in observations:
+        predicted_state.append(state)
+        predicted_covariance.append(covariance + process_var)
+        state = predicted_state[-1]
+        covariance = predicted_covariance[-1]
+        if math.isfinite(observation):
+            kalman_gain = covariance / (covariance + measurement_var)
+            state = state + kalman_gain * (observation - state)
+            covariance = (1 - kalman_gain) * covariance
+        forward_state.append(state)
+        forward_covariance.append(covariance)
+
+    smoothed = list(forward_state)
+    smoothed_covariance = list(forward_covariance)
+    for index in range(len(observations) - 2, -1, -1):
+        denominator = predicted_covariance[index + 1]
+        if denominator <= 0:
+            continue
+        smoother_gain = forward_covariance[index] / denominator
+        smoothed[index] = forward_state[index] + smoother_gain * (smoothed[index + 1] - predicted_state[index + 1])
+        smoothed_covariance[index] = forward_covariance[index] + (
+            smoother_gain**2 * (smoothed_covariance[index + 1] - predicted_covariance[index + 1])
+        )
+
+    lower = min(observed_values)
+    upper = max(observed_values)
+    spread = max(1e-9, upper - lower)
+    floor = lower - spread
+    ceil = upper + spread
+    bounded: list[float] = []
+    for index, value in enumerate(smoothed):
+        if math.isfinite(observations[index]):
+            bounded.append(observations[index])
+            continue
+        bounded.append(min(max(value, floor), ceil))
+    return bounded
 
 
 def densify_gold_m1_timeframe(gold: pl.DataFrame) -> pl.DataFrame:
@@ -1033,8 +1193,7 @@ def _missing_minute_timestamps(gold: pl.DataFrame) -> list[datetime]:
         row["ts_minute"]
         for row in rows
         if isinstance(row["ts_minute"], datetime)
-        and isinstance(row["quality_flags"], list)
-        and "missing_minute" in row["quality_flags"]
+        and _is_unfilled_missing_minute_row(row)
     ]
 
 
@@ -1046,11 +1205,32 @@ def _missing_minute_count(gold: pl.DataFrame) -> int:
     return int(gold.select(pl.col("quality_flags").list.contains("missing_minute").sum()).item())
 
 
+def _validate_fill_policy(fill_policy: str) -> None:
+    """Validate one configured Gold fill policy value."""
+
+    if fill_policy not in GOLD_FILL_POLICIES:
+        raise ValueError(f"fill_policy must be one of {GOLD_FILL_POLICIES}")
+
+
+def _gold_fill_strategy(fill_policy: str) -> GoldGapFillStrategy:
+    """Resolve one configured fill policy into a concrete strategy."""
+
+    _validate_fill_policy(fill_policy)
+    return _GOLD_FILL_STRATEGIES[fill_policy]
+
+
 def _quality_flags(row: dict[str, Any]) -> list[str]:
     """Return quality flags from a Gold row dictionary."""
 
     flags = row.get("quality_flags", [])
     return [str(flag) for flag in flags] if isinstance(flags, list) else []
+
+
+def _is_unfilled_missing_minute_row(row: dict[str, Any]) -> bool:
+    """Return whether one row is still an unfilled missing-minute gap."""
+
+    flags = set(_quality_flags(row))
+    return "missing_minute" in flags and not bool(flags.intersection(GOLD_FILLED_QUALITY_FLAGS))
 
 
 def _can_fill_row_from_neighbors(rows: list[dict[str, Any]], index: int) -> bool:

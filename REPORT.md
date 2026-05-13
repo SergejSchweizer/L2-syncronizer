@@ -40,6 +40,7 @@ The builder records Bronze input content fingerprints in `lake/silver/_silver_tr
 Gold aggregates Silver features into dense M1 datasets. Missing minutes are explicit rows with zero coverage, `quality_flags = ["missing_minute"]`, and numeric features set to `NaN`.
 When the Gold fill option is enabled, `fill_policy=neighbor` averages missing rows from the immediately preceding and following non-missing Gold minutes and adds `filled_neighbor_average`.
 With `fill_policy=hybrid`, short internal runs are linearly interpolated (`filled_linear_interpolation`), short boundary runs are filled from a single neighbor (`filled_forward_boundary` or `filled_backward_boundary`), and long gaps remain missing with `missing_long_gap`.
+With `fill_policy=kalman`, hybrid rules run first and then long internal runs are filled via one-dimensional Kalman smoothing; those rows add `filled_kalman_long_gap`.
 
 The builder records Silver input content fingerprints by symbol in `lake/gold/_gold_transform_state.json`. Unchanged symbols are skipped. Changed symbols are rebuilt from all Silver files for that symbol, preserving full-timeframe Gold outputs while avoiding cross-symbol rescans.
 
@@ -55,7 +56,7 @@ The test suite covers:
 - L2 polling concurrency, partial failure isolation, and runtime budgets.
 - Bronze partition layout and idempotent row persistence.
 - Silver feature math, incremental state, idempotent monthly merge behavior, and artifact toggles.
-- Gold M1 aggregation, missing-minute densification/filling, fill edge-case guards, content-sensitive artifact hashes, plot sampling, incremental symbol rebuilds, and artifact toggles.
+- Gold M1 aggregation, missing-minute densification/filling, fill edge-case guards, Kalman long-gap filling, content-sensitive artifact hashes, plot sampling, incremental symbol rebuilds, and artifact toggles.
 - Gold incremental invalidation when completeness threshold or fill policy settings change.
 - Explicit Bronze, Silver, and Gold schema contracts.
 

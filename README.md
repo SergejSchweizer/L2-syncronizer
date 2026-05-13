@@ -234,7 +234,7 @@ python main.py gold-builder [options]
 | `--expected-snapshots-per-minute EXPECTED` | Expected Silver snapshots per minute for quality coverage. Defaults to `6`. |
 | `--completeness-threshold THRESHOLD` | Minimum coverage ratio for a complete minute. Defaults to `0.8`. |
 | `--fill-missing-minutes`, `--no-fill-missing-minutes` | Enable or disable Gold missing-minute feature filling. Defaults to disabled. |
-| `--fill-policy {neighbor,hybrid}` | Fill strategy used when `--fill-missing-minutes` is enabled. Defaults to `neighbor`. |
+| `--fill-policy {neighbor,hybrid,kalman}` | Fill strategy used when `--fill-missing-minutes` is enabled. Defaults to `neighbor`. |
 | `--plot`, `--no-plot` | Enable or suppress Gold PNG profile generation. Defaults to enabled. |
 | `--manifest`, `--no-manifest` | Enable or suppress Gold JSON metadata manifest generation. Defaults to enabled. |
 | `--json-output`, `--no-json-output` | Enable or suppress JSON output. Logs are still emitted. |
@@ -248,6 +248,7 @@ python main.py gold-builder
 Gold is M1-only. Each dataset is materialized on the full one-minute scale from its lowest observed minute through its latest observed minute. Observed minutes use first/max/min/last/mean/std semantics inside the minute. Missing minutes are written as explicit rows with `snapshot_count = 0`, `coverage_ratio = 0.0`, `is_complete_minute = false`, `quality_flags = ["missing_minute"]`, and numeric feature values set to `NaN`; values are not forward-filled. With the default quality policy, `expected_snapshots_per_minute = 6`, `coverage_ratio = snapshot_count / 6`, and `is_complete_minute = coverage_ratio >= 0.8`.
 When `--fill-missing-minutes` is enabled with `--fill-policy neighbor`, missing Gold rows keep `snapshot_count = 0`, `coverage_ratio = 0.0`, and `is_complete_minute = false`, but numeric feature values are replaced by the average of the immediately preceding and following non-missing Gold minutes. Filled rows add `filled_neighbor_average` to `quality_flags`.
 When `--fill-policy hybrid` is selected, short internal gap runs are linearly interpolated (`filled_linear_interpolation`), short boundary runs are filled from the nearest observed minute (`filled_forward_boundary` or `filled_backward_boundary`), and long gaps remain missing with `missing_long_gap`.
+When `--fill-policy kalman` is selected, Gold first applies the hybrid rules and then uses one-dimensional Kalman smoothing to fill long internal missing runs; successful long-gap fills are flagged as `filled_kalman_long_gap`.
 The Gold builder records Silver parquet content fingerprints by symbol in `lake/gold/_gold_transform_state.json`. Unchanged symbols are skipped; changed symbols are rebuilt from all Silver files for that symbol so each emitted Gold artifact remains a full timeframe dataset.
 
 For each exchange, instrument type, base asset, source symbol, depth, and timeframe, Gold writes a full versioned dataset at the `timeframe=1m` leaf. The three artifacts share the same reproducibility basename:
@@ -261,6 +262,31 @@ lake/gold/dataset_type=l2_m1_features/feature_set_version=gold_l2_m1_v1/exchange
 The JSON metadata contains dataset-level and feature-level metadata, including dataset type, feature-set version, timeframe, hash string, UTC build timestamp, row/column stats, timestamp bounds, missing-minute counts, source Silver dataset summaries, source fingerprint hash, Gold content hash, and per-feature dtype/null/NaN/numeric distribution stats. It intentionally does not store filesystem paths.
 
 The PNG profile uses the same basename. It plots all numeric Gold features as feature rows: line plots on the left panel and dark distribution histograms on the right panel. Line plots use at most 3,000 evenly spaced rows representing the full time scale; Parquet and JSON artifacts keep the complete dataset. Missing minutes are visible as broken line segments caused by `NaN` values and as red shaded spans. The plot header carries key manifest metadata, while each feature subplot shows only a compact left-side metadata window with feature name, time range, and row statistics.
+
+### Gold Profile Example
+
+The BTC-PERPETUAL `1m` profile example (Deribit perp, depth `50`) is the expected shape for a fully generated Gold PNG:
+
+- Header block:
+  - dataset identity (`exchange`, `symbol`, `instrument_type`, `depth`)
+  - reproducibility fields (`hash`, git commit prefix, timeframe window)
+  - row counts and missing-minute count
+- Left column:
+  - one time-series panel per Gold numeric feature (for example `mid_open`, `mid_close`, `spread_bps_mean`, depth-window pressure/imbalance, and market carry fields)
+  - the line should remain continuous where rows were successfully filled
+  - red shaded spans indicate **unfilled** missing minutes only
+- Right column:
+  - per-feature histograms for value distribution and range sanity checks
+- Typical visual cues in this example:
+  - price-family panels (`mid_*`, `microprice_*`) move together with short-term spikes
+  - spread and imbalance panels show bursty microstructure behavior with sparse extremes
+  - depth-volume means are right-skewed with occasional tall bursts
+
+Use this profile view as a fast QA pass:
+
+- If red spans persist in dense periods, inspect fill policy and run logs.
+- If one feature remains fragmented while peers are smooth, inspect source-value finiteness for that feature.
+- If histogram mass shifts abruptly across runs, compare source fingerprint/hash and recent market regime.
 
 The Gold job logs to `.logs/gold-builder.log` by default and allows overlapping transform launches.
 
@@ -398,7 +424,7 @@ Gold M1 rows are derived from Silver:
 | `bid_volume_N_mean`, `ask_volume_N_mean` | Mean cumulative book size for each depth window. |
 | `book_pressure_N_mean` | Mean `bid_volume_N / (bid_volume_N + ask_volume_N)` for each depth window. |
 | `mark_price_last`, `index_price_last`, `open_interest_last`, `funding_rate_last` | Last market fields in the minute. |
-| `is_complete_minute`, `quality_flags` | Gold quality status. Missing scale rows use `quality_flags = ["missing_minute"]`; optional fill annotations can include `filled_neighbor_average`, `filled_linear_interpolation`, `filled_forward_boundary`, `filled_backward_boundary`, or `missing_long_gap`. |
+| `is_complete_minute`, `quality_flags` | Gold quality status. Missing scale rows use `quality_flags = ["missing_minute"]`; optional fill annotations can include `filled_neighbor_average`, `filled_linear_interpolation`, `filled_forward_boundary`, `filled_backward_boundary`, `missing_long_gap`, or `filled_kalman_long_gap`. |
 
 ## Testing
 
@@ -421,7 +447,7 @@ Current coverage highlights:
 - CLI command parsing/defaults and builder dispatch behavior.
 - Bronze parquet partition layout and idempotent merge semantics.
 - Silver feature calculations, incremental invalidation, and artifact toggles.
-- Gold M1 aggregation with missing-minute densification and configurable neighbor/hybrid fill policies.
+- Gold M1 aggregation with missing-minute densification and configurable neighbor/hybrid/kalman fill policies.
 - Gold edge-case guards where fill is skipped when adjacent observed minutes are unavailable.
 - Gold incremental invalidation when completeness or fill policy settings change.
 - Schema contracts for Bronze, Silver, and Gold outputs.

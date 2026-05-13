@@ -193,7 +193,7 @@ def build_parser(config: Config | None = None) -> argparse.ArgumentParser:
     )
     gold_parser.add_argument(
         "--fill-policy",
-        choices=["neighbor", "hybrid"],
+        choices=["neighbor", "hybrid", "kalman"],
         default="neighbor",
         help="Gap-filling policy used when --fill-missing-minutes is enabled",
     )

@@ -12,6 +12,7 @@ import pytest
 
 from ingestion.gold import (
     GOLD_NUMERIC_FEATURES,
+    _missing_minute_timestamps,
     base_asset_symbol,
     dataframe_content_hash,
     fill_gold_missing_minutes_hybrid,
@@ -289,6 +290,41 @@ def test_gold_l2_m1_from_silver_hybrid_respects_boundary_fill_max_gap() -> None:
         assert math.isnan(row["mid_open"])
 
 
+def test_gold_l2_m1_from_silver_kalman_fills_long_internal_gap() -> None:
+    """Verify kalman policy fills long internal missing-minute runs."""
+
+    silver = pl.DataFrame(
+        [
+            _silver_row(second=0, minute=0, mid_price=100.0),
+            _silver_row(second=0, minute=8, mid_price=108.0),
+        ]
+    )
+    filled = gold_l2_m1_from_silver(silver, fill_missing_minutes=True, fill_policy="kalman")
+    middle_row = filled.row(4, named=True)
+
+    assert "filled_kalman_long_gap" in middle_row["quality_flags"]
+    assert "missing_long_gap" not in middle_row["quality_flags"]
+    assert math.isfinite(float(middle_row["mid_open"]))
+
+
+def test_missing_minute_timestamps_only_include_unfilled_rows() -> None:
+    """Verify plot shading includes only missing rows that remain unfilled."""
+
+    base_ts = datetime(2026, 5, 6, 10, 0, tzinfo=UTC)
+    gold = pl.DataFrame(
+        {
+            "ts_minute": [base_ts, datetime(2026, 5, 6, 10, 1, tzinfo=UTC), datetime(2026, 5, 6, 10, 2, tzinfo=UTC)],
+            "quality_flags": [
+                ["missing_minute"],
+                ["missing_minute", "filled_neighbor_average"],
+                ["missing_minute", "filled_kalman_long_gap"],
+            ],
+        }
+    )
+
+    assert _missing_minute_timestamps(gold) == [base_ts]
+
+
 def test_write_gold_l2_m1_artifacts_writes_parquet_json_and_png(tmp_path: Path) -> None:
     """Verify Gold artifacts are written under the versioned timeframe dataset leaf."""
 
@@ -428,6 +464,19 @@ def test_write_gold_l2_m1_artifacts_hash_changes_when_fill_policy_changes(tmp_pa
     )
 
     assert Path(neighbor_files[0]).stem != Path(hybrid_files[0]).stem
+
+    kalman_files = write_gold_l2_m1_artifacts(
+        gold=gold,
+        gold_lake_root=str(tmp_path),
+        source_summary=silver_source_summary(silver),
+        git_commit_hash="abcdef1234567890",
+        plot=False,
+        manifest=False,
+        densify=False,
+        fill_missing_minutes=True,
+        fill_policy="kalman",
+    )
+    assert Path(kalman_files[0]).stem != Path(hybrid_files[0]).stem
 
 
 def test_gold_plot_metadata_lines_include_manifest_context() -> None:
@@ -707,6 +756,17 @@ def test_transform_l2_silver_to_gold_rebuilds_when_fill_policy_changes(tmp_path:
     assert len(third_files) == 1
     assert Path(second_files[0]).stem != Path(third_files[0]).stem
 
+    fourth_files = transform_l2_silver_to_gold(
+        silver_lake_root=str(silver_root),
+        gold_lake_root=str(gold_root),
+        fill_missing_minutes=True,
+        fill_policy="kalman",
+        plot=False,
+        manifest=False,
+    )
+    assert len(fourth_files) == 1
+    assert Path(third_files[0]).stem != Path(fourth_files[0]).stem
+
 
 def test_transform_l2_silver_to_gold_rejects_unknown_fill_policy(tmp_path: Path) -> None:
     """Verify unknown fill policies fail fast before transform execution."""
@@ -754,3 +814,16 @@ def test_gold_metadata_records_fill_policy_flag() -> None:
 
     assert metadata["fill_missing_minutes"] is True
     assert metadata["fill_policy"] == "hybrid"
+
+    kalman_metadata = gold_metadata(
+        gold=gold,
+        source_summary=silver_source_summary(silver),
+        hash_string="hash123",
+        git_commit_hash="abcdef1234567890",
+        expected_snapshots_per_minute=6,
+        completeness_threshold=0.8,
+        feature_set_version="gold_l2_m1_v1",
+        fill_missing_minutes=True,
+        fill_policy="kalman",
+    )
+    assert kalman_metadata["fill_policy"] == "kalman"
